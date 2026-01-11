@@ -1,0 +1,6 @@
+[submodule "vendor/mamba"]
+	path = vendor/mamba
+	url = git@github.com:state-spaces/mamba.git
+[submodule "vendor/onnx"]
+	path = vendor/onnx
+	url = git@github.com:onnx/onnx.git
