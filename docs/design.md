@@ -5,7 +5,7 @@
 The project consists of two main execution paths for the MambaBlock: the Control (Slow) path and the Kernel (Fast) path.
 
 ### 1. The Control (Baseline)
-- **Component**: Single `MambaBlock` (config: `d_model=768`, `d_state=16`).
+- **Component**: Single `MambaBlock` from Hugging Face `transformers` (config: `d_model=768`, `d_state=16`).
 - **Export Mechanism**: `torch.onnx.export` on the native PyTorch module.
 - **Result**: A large ONNX graph where the scan loop is unrolled into ~250+ individual nodes.
 - **Runtime**: Standard ONNX Runtime execution, suffering from interpreter overhead for many small ops.

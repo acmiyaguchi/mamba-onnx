@@ -1,0 +1,7 @@
+build/
+lib/
+*.onnx
+*.onnx.data
+.venv/
+__pycache__/
+*.so

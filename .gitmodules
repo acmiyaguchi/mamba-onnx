@@ -4,3 +4,6 @@
 [submodule "vendor/onnx"]
 	path = vendor/onnx
 	url = git@github.com:onnx/onnx.git
+[submodule "vendor/onnxruntime"]
+	path = vendor/onnxruntime
+	url = https://github.com/microsoft/onnxruntime.git
