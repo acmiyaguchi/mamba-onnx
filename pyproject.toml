@@ -8,21 +8,27 @@ dependencies = [
     "numpy>=1.26.0",
     "onnx>=1.14.0",
     "onnxruntime>=1.16.0",
+]
+
+[project.optional-dependencies]
+dev = [
     "torch>=2.0.0",
     "matplotlib>=3.7.0",
     "pandas>=2.0.0",
-    "memory_profiler>=0.61.0",
+    "einops>=0.7.0",
+    "pytest>=7.0.0",
 ]
 
 [build-system]
-requires = ["scikit-build-core", "pybind11"]
+requires = ["scikit-build-core>=0.5", "cmake>=3.18"]
 build-backend = "scikit_build_core.build"
 
 [tool.scikit-build]
 cmake.version = ">=3.18"
-cmake.source-dir = "csrc"
-# Install the library into the package directory
+cmake.build-type = "Release"
+# The wheel will contain the Python package + compiled .so
 wheel.packages = ["src/mamba_onnx"]
+wheel.install-dir = "mamba_onnx"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
