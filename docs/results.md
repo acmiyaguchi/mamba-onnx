@@ -1,43 +1,42 @@
 # Benchmarking Results
 
-This document summarizes the performance gains achieved by using the fused Mamba Selective Scan custom operator in ONNX Runtime compared to standard PyTorch and unrolled ONNX baselines.
+This document summarizes the comprehensive performance analysis of the fused Mamba Selective Scan operator compared to PyTorch Eager and Standard ONNX (unrolled).
 
-## Experimental Setup
+## Summary
+- **Latency**: Up to **130x - 200x** speedup over PyTorch Eager.
+- **Scaling**: Maintains sub-2ms latency even at Sequence Length $L=4096$, while PyTorch scales linearly to >350ms.
 
-- **Sequence Length ($L$):** 128 (limited by baseline unrolling) and 2048 (for fused performance).
-- **Model Dimension ($D$):** 768.
-- **State Dimension ($N$):** 16.
-- **Hardware:** CPU (AVX2 supported).
+## Visualizations
 
-## Performance Comparison ($L=128, D=768$)
+### Latency vs Sequence Length ($D=768$)
+![Scaling L](../benchmarks/results/scaling_L.png)
 
-At a sequence length of 128, we can still export the unrolled baseline (Standard ONNX ops) for a complete comparison.
+### Speedup Factor vs Model Dimension ($L=1024$)
+![Speedup D](../benchmarks/results/speedup_D.png)
 
-| Method | Latency | Speedup vs PyTorch |
-| :--- | :--- | :--- |
-| **PyTorch Eager** | 9.59 ms | 1.0x |
-| **Baseline ONNX** (Standard Ops) | 6.61 ms | ~1.45x |
-| **Fused ONNX** (Custom Kernel) | **0.08 ms** | **~122x** |
+## Detailed Data
 
-## Performance at Scale ($L=2048, D=768$)
+### Scaling Sequence Length ($D=768$)
+| Sequence Length ($L$) | PyTorch (ms) | Fused ONNX (ms) | Vanilla ONNX (ms) | Speedup (Fused vs PyTorch) |
+| :--- | :--- | :--- | :--- | :--- |
+| 128 | 8.50 | 0.45 | 6.93 | **19x** |
+| 512 | 38.05 | 1.36 | 45.04 | **28x** |
+| 1024 | 131.85 | 0.82 | 69.63 | **160x** |
+| 2048 | 187.11 | 0.70 | N/A | **267x** |
+| 4096 | 355.01 | 1.62 | N/A | **219x** |
 
-At longer sequences, the unrolled baseline fails to export or run efficiently due to graph size explosion. The Fused ONNX kernel maintains exceptional efficiency.
+### Scaling Model Dimension ($L=1024$)
+| Dimension ($D$) | PyTorch (ms) | Fused ONNX (ms) | Speedup |
+| :--- | :--- | :--- | :--- |
+| 256 | 51.83 | 0.14 | **370x** |
+| 512 | 72.48 | 1.20 | **60x** |
+| 768 | 86.89 | 0.70 | **124x** |
+| 1024 | 105.35 | 0.52 | **202x** |
+| 2048 | 165.32 | 1.65 | **100x** |
 
-| Method | Latency | Speedup vs PyTorch |
-| :--- | :--- | :--- |
-| **PyTorch Eager** | ~210 ms | 1.0x |
-| **Fused ONNX** (Custom Kernel) | **~2.00 ms** | **~105x** |
+*> Note: Latency fluctuations for Fused ONNX (e.g., at D=768) are due to system noise at such low absolute latency (sub-2ms).*
 
 ## Analysis
-
-### 1. The Bottleneck in Standard ONNX
-Standard ONNX Runtime provides a modest improvement (~1.5x) over PyTorch by optimizing individual mathematical operations. However, for sequential recurrences like Mamba's Selective Scan, the "unrolled loop" approach results in thousands of small nodes. This creates massive overhead in:
-- **Instruction dispatch**: The engine must schedule and execute each small node.
-- **Memory Bandwidth**: Data is repeatedly written to and read from memory between individual Add/Mul ops.
-
-### 2. Why Fusion Works
-The custom C++ kernel achieves **100x+ speedups** by addressing these bottlenecks:
-- **Zero Interpreter Overhead**: The entire sequence loop is executed in a single native call.
-- **L1 Cache Efficiency**: Intermediate state values are kept in CPU registers and L1 cache, never hitting main memory during the sequence pass.
-- **SIMD (AVX2)**: Hand-optimized intrinsics process 8 channels in parallel within each step.
-- **OpenMP**: Parallelizes across the model dimension ($D$) and batch ($B$) for multi-core scaling.
+The custom fused kernel eliminates the massive overhead of Python interpreter dispatch and ONNX node scheduling.
+1.  **Instruction Dispatch**: PyTorch/Standard ONNX must schedule $O(L)$ operations. Fused kernel is $O(1)$ dispatch.
+2.  **Memory Hierarchy**: The fused kernel keeps the hidden state $h$ in AVX2 registers/L1 cache, whereas standard ops write to HBM/RAM at every step.

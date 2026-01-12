@@ -9,6 +9,9 @@ dependencies = [
     "onnx>=1.14.0",
     "onnxruntime>=1.16.0",
     "torch>=2.0.0",
+    "matplotlib>=3.7.0",
+    "pandas>=2.0.0",
+    "memory_profiler>=0.61.0",
 ]
 
 [build-system]
