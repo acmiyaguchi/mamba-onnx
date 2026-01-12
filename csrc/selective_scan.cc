@@ -104,8 +104,8 @@ struct MambaSelectiveScanKernel {
                 __m256 h_0 = _mm256_setzero_ps();
                 __m256 h_1 = _mm256_setzero_ps();
                 
-                __m256 ones = _mm256_set1_ps(1.0f);
-
+                // Removed explicit 'ones' vector as it's no longer needed for A_bar calculation
+                
                 for (int64_t l = 0; l < seqlen; ++l) {
                     int64_t u_idx = b * dim * seqlen + d * seqlen + l;
                     int64_t BC_idx = b * seqlen * 16 + l * 16;
@@ -113,26 +113,27 @@ struct MambaSelectiveScanKernel {
                     float u_t = u_data[u_idx];
                     float delta_t = delta_data[u_idx];
 
-                    // Approximation: exp(x) ~ 1 + x
-                    // A_bar = exp(delta * A) ~ 1 + delta * A
+                    __m256 u_vec = _mm256_set1_ps(u_t);
                     __m256 delta_vec = _mm256_set1_ps(delta_t);
-                    
-                    __m256 A_bar_0 = _mm256_fmadd_ps(delta_vec, A_0, ones);
-                    __m256 A_bar_1 = _mm256_fmadd_ps(delta_vec, A_1, ones);
 
                     __m256 B_t_0 = _mm256_loadu_ps(B_data + BC_idx);
                     __m256 B_t_1 = _mm256_loadu_ps(B_data + BC_idx + 8);
 
-                    __m256 B_bar_0 = _mm256_mul_ps(delta_vec, B_t_0);
-                    __m256 B_bar_1 = _mm256_mul_ps(delta_vec, B_t_1);
-
-                    __m256 u_vec = _mm256_set1_ps(u_t);
+                    // Optimization: h = (1 + delta*A)*h + delta*B*u
+                    //             = h + delta * (A*h + B*u)
+                    // Reduces from 4 vector ops (2 FMA, 2 MUL) to 3 vector ops (2 FMA, 1 MUL)
                     
-                    __m256 B_u_0 = _mm256_mul_ps(B_bar_0, u_vec);
-                    __m256 B_u_1 = _mm256_mul_ps(B_bar_1, u_vec);
+                    // tmp = B * u
+                    __m256 tmp_0 = _mm256_mul_ps(B_t_0, u_vec);
+                    __m256 tmp_1 = _mm256_mul_ps(B_t_1, u_vec);
 
-                    h_0 = _mm256_fmadd_ps(A_bar_0, h_0, B_u_0);
-                    h_1 = _mm256_fmadd_ps(A_bar_1, h_1, B_u_1);
+                    // tmp = A * h + tmp = A * h + B * u
+                    tmp_0 = _mm256_fmadd_ps(A_0, h_0, tmp_0);
+                    tmp_1 = _mm256_fmadd_ps(A_1, h_1, tmp_1);
+
+                    // h = h + delta * tmp
+                    h_0 = _mm256_fmadd_ps(delta_vec, tmp_0, h_0);
+                    h_1 = _mm256_fmadd_ps(delta_vec, tmp_1, h_1);
 
                     __m256 C_t_0 = _mm256_loadu_ps(C_data + BC_idx);
                     __m256 C_t_1 = _mm256_loadu_ps(C_data + BC_idx + 8);
