@@ -65,8 +65,133 @@ fn fast_silu(x: f32) f32 {
 }
 
 // =============================================================================
-// Selective Scan Kernel
+// Selective Scan Kernel (Parallel)
 // =============================================================================
+
+const MAX_THREADS = 32;
+
+/// Work parameters shared across threads
+fn WorkParams(comptime use_fused: bool) type {
+    return struct {
+        batch: usize,
+        dim: usize,
+        seqlen: usize,
+        u_data: [*]const f32,
+        delta_data: [*]const f32,
+        A_data: [*]const f32,
+        B_data: [*]const f32,
+        C_data: [*]const f32,
+        D_data: [*]const f32,
+        z_data: if (use_fused) [*]const f32 else ?[*]const f32,
+        out_data: [*]f32,
+    };
+}
+
+/// Process a single (batch, dim) pair - the inner sequential scan
+fn processOneDim(
+    comptime use_fused: bool,
+    comptime use_exact: bool,
+    b: usize,
+    d: usize,
+    dim: usize,
+    seqlen: usize,
+    u_data: [*]const f32,
+    delta_data: [*]const f32,
+    A_data: [*]const f32,
+    B_data: [*]const f32,
+    C_data: [*]const f32,
+    D_data: [*]const f32,
+    z_data: ?[*]const f32,
+    out_data: [*]f32,
+) void {
+    const A_ptr = A_data + d * 16;
+    const D_val = D_data[d];
+
+    const A_0: Vec8 = A_ptr[0..8].*;
+    const A_1: Vec8 = (A_ptr + 8)[0..8].*;
+
+    var h_0: Vec8 = @splat(0);
+    var h_1: Vec8 = @splat(0);
+
+    for (0..seqlen) |l| {
+        const u_idx = b * dim * seqlen + d * seqlen + l;
+        const bc_idx = b * seqlen * 16 + l * 16;
+
+        const u_t = u_data[u_idx];
+        var delta_t = delta_data[u_idx];
+
+        if (use_fused) {
+            delta_t = fast_softplus(delta_t);
+        }
+
+        const u_vec: Vec8 = @splat(u_t);
+        const delta_vec: Vec8 = @splat(delta_t);
+
+        const B_ptr = B_data + bc_idx;
+        const B_t_0: Vec8 = B_ptr[0..8].*;
+        const B_t_1: Vec8 = (B_ptr + 8)[0..8].*;
+
+        if (use_exact) {
+            const A_bar_0 = fast_exp(delta_vec * A_0);
+            const A_bar_1 = fast_exp(delta_vec * A_1);
+            const B_bar_0 = delta_vec * B_t_0;
+            const B_bar_1 = delta_vec * B_t_1;
+
+            h_0 = @mulAdd(Vec8, A_bar_0, h_0, B_bar_0 * u_vec);
+            h_1 = @mulAdd(Vec8, A_bar_1, h_1, B_bar_1 * u_vec);
+        } else {
+            const tmp_0 = @mulAdd(Vec8, A_0, h_0, B_t_0 * u_vec);
+            const tmp_1 = @mulAdd(Vec8, A_1, h_1, B_t_1 * u_vec);
+            h_0 = @mulAdd(Vec8, delta_vec, tmp_0, h_0);
+            h_1 = @mulAdd(Vec8, delta_vec, tmp_1, h_1);
+        }
+
+        const C_ptr = C_data + bc_idx;
+        const C_t_0: Vec8 = C_ptr[0..8].*;
+        const C_t_1: Vec8 = (C_ptr + 8)[0..8].*;
+
+        const y_0 = C_t_0 * h_0;
+        const y_1 = C_t_1 * h_1;
+
+        var y_scalar = @reduce(.Add, y_0) + @reduce(.Add, y_1);
+        y_scalar += D_val * u_t;
+
+        if (use_fused) {
+            if (z_data) |z| {
+                y_scalar *= fast_silu(z[u_idx]);
+            }
+        }
+
+        out_data[u_idx] = y_scalar;
+    }
+}
+
+/// Worker thread function - processes a range of (batch*dim) indices
+fn workerFn(
+    comptime use_fused: bool,
+    comptime use_exact: bool,
+    start_idx: usize,
+    end_idx: usize,
+    batch: usize,
+    dim: usize,
+    seqlen: usize,
+    u_data: [*]const f32,
+    delta_data: [*]const f32,
+    A_data: [*]const f32,
+    B_data: [*]const f32,
+    C_data: [*]const f32,
+    D_data: [*]const f32,
+    z_data: ?[*]const f32,
+    out_data: [*]f32,
+) void {
+    _ = batch;
+    var idx = start_idx;
+    while (idx < end_idx) : (idx += 1) {
+        const b = idx / dim;
+        const d = idx % dim;
+        processOneDim(use_fused, use_exact, b, d, dim, seqlen, u_data, delta_data, A_data, B_data, C_data, D_data, z_data, out_data);
+    }
+}
 
 fn selectiveScanKernel(
     comptime use_fused: bool,
@@ -83,69 +208,61 @@ fn selectiveScanKernel(
     z_data: ?[*]const f32,
     out_data: [*]f32,
 ) void {
-    for (0..batch) |b| {
-        for (0..dim) |d| {
-            const A_ptr = A_data + d * 16;
-            const D_val = D_data[d];
+    const total_work = batch * dim;
 
-            const A_0: Vec8 = A_ptr[0..8].*;
-            const A_1: Vec8 = (A_ptr + 8)[0..8].*;
+    // Estimate work per item (seqlen iterations with SIMD ops)
+    // Thread spawn overhead is ~10-50us, so we need enough work to amortize
+    const work_estimate = total_work * seqlen;
+    const MIN_WORK_PER_THREAD = 4096; // Minimum iterations per thread to be worth spawning
 
-            var h_0: Vec8 = @splat(0);
-            var h_1: Vec8 = @splat(0);
+    // Get number of threads based on work size
+    const cpu_count = std.Thread.getCpuCount() catch 4;
+    const max_useful_threads = @max(1, work_estimate / MIN_WORK_PER_THREAD);
+    const num_threads = @min(@min(@min(cpu_count, MAX_THREADS), total_work), max_useful_threads);
 
-            for (0..seqlen) |l| {
-                const u_idx = b * dim * seqlen + d * seqlen + l;
-                const bc_idx = b * seqlen * 16 + l * 16;
-
-                const u_t = u_data[u_idx];
-                var delta_t = delta_data[u_idx];
-
-                if (use_fused) {
-                    delta_t = fast_softplus(delta_t);
-                }
-
-                const u_vec: Vec8 = @splat(u_t);
-                const delta_vec: Vec8 = @splat(delta_t);
-
-                const B_ptr = B_data + bc_idx;
-                const B_t_0: Vec8 = B_ptr[0..8].*;
-                const B_t_1: Vec8 = (B_ptr + 8)[0..8].*;
-
-                if (use_exact) {
-                    const A_bar_0 = fast_exp(delta_vec * A_0);
-                    const A_bar_1 = fast_exp(delta_vec * A_1);
-                    const B_bar_0 = delta_vec * B_t_0;
-                    const B_bar_1 = delta_vec * B_t_1;
-
-                    h_0 = @mulAdd(Vec8, A_bar_0, h_0, B_bar_0 * u_vec);
-                    h_1 = @mulAdd(Vec8, A_bar_1, h_1, B_bar_1 * u_vec);
-                } else {
-                    const tmp_0 = @mulAdd(Vec8, A_0, h_0, B_t_0 * u_vec);
-                    const tmp_1 = @mulAdd(Vec8, A_1, h_1, B_t_1 * u_vec);
-                    h_0 = @mulAdd(Vec8, delta_vec, tmp_0, h_0);
-                    h_1 = @mulAdd(Vec8, delta_vec, tmp_1, h_1);
-                }
-
-                const C_ptr = C_data + bc_idx;
-                const C_t_0: Vec8 = C_ptr[0..8].*;
-                const C_t_1: Vec8 = (C_ptr + 8)[0..8].*;
-
-                const y_0 = C_t_0 * h_0;
-                const y_1 = C_t_1 * h_1;
-
-                var y_scalar = @reduce(.Add, y_0) + @reduce(.Add, y_1);
-                y_scalar += D_val * u_t;
-
-                if (use_fused) {
-                    if (z_data) |z| {
-                        y_scalar *= fast_silu(z[u_idx]);
-                    }
-                }
-
-                out_data[u_idx] = y_scalar;
+    // For small workloads or single thread, run directly
+    if (num_threads <= 1) {
+        for (0..batch) |b| {
+            for (0..dim) |d| {
+                processOneDim(use_fused, use_exact, b, d, dim, seqlen, u_data, delta_data, A_data, B_data, C_data, D_data, z_data, out_data);
             }
         }
+        return;
+    }
+
+    // Parallel execution - spawn (num_threads - 1) workers, main thread does work too
+    var threads: [MAX_THREADS]std.Thread = undefined;
+    const work_per_thread = total_work / num_threads;
+    const remainder = total_work % num_threads;
+
+    var start_idx: usize = 0;
+    const threads_to_spawn = num_threads - 1; // Main thread will do work too
+
+    for (0..threads_to_spawn) |t| {
+        const extra: usize = if (t < remainder) 1 else 0;
+        const end_idx = start_idx + work_per_thread + extra;
+
+        threads[t] = std.Thread.spawn(
+            .{},
+            workerFn,
+            .{ use_fused, use_exact, start_idx, end_idx, batch, dim, seqlen, u_data, delta_data, A_data, B_data, C_data, D_data, z_data, out_data },
+        ) catch {
+            // Fallback: run this chunk on main thread if spawn fails
+            workerFn(use_fused, use_exact, start_idx, end_idx, batch, dim, seqlen, u_data, delta_data, A_data, B_data, C_data, D_data, z_data, out_data);
+            continue;
+        };
+
+        start_idx = end_idx;
+    }
+
+    // Main thread processes remaining work
+    const main_extra: usize = if (threads_to_spawn < remainder) 1 else 0;
+    const main_end = start_idx + work_per_thread + main_extra;
+    workerFn(use_fused, use_exact, start_idx, main_end, batch, dim, seqlen, u_data, delta_data, A_data, B_data, C_data, D_data, z_data, out_data);
+
+    // Join spawned threads
+    for (0..threads_to_spawn) |t| {
+        threads[t].join();
     }
 }
 
