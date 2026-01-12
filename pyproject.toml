@@ -21,7 +21,8 @@ dev = [
 
 [build-system]
 requires = ["setuptools>=61"]
-build-backend = "setuptools.build_meta"
+build-backend = "build_backend"
+backend-path = ["."]
 
 [tool.setuptools.packages.find]
 where = ["src"]
