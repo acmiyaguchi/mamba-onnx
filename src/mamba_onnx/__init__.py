@@ -1,83 +1,115 @@
 """
 Mamba Selective Scan Custom Op for ONNX Runtime.
 
-Provides optimized AVX2 implementations of the Mamba selective scan operation
+Provides optimized implementations of the Mamba selective scan operation
 with 4 variants for different accuracy/performance tradeoffs:
   - SelectiveScan: Linear discretization (fastest)
   - SelectiveScanExact: Exact exp() discretization
   - SelectiveScanFused: Linear + Softplus/SiLU fusion
   - SelectiveScanFusedExact: Exact + Softplus/SiLU fusion
+
+Build with: zig build -Doptimize=ReleaseFast
 """
 import os
 import sys
+from pathlib import Path
 
 __version__ = "0.1.0"
 
-def get_library_path():
-    """Returns the path to the compiled shared library."""
-    base_path = os.path.dirname(__file__)
+_LIB_DIR = Path(__file__).parent
 
-    # Platform-specific library names
-    if sys.platform == "win32":
-        lib_names = ["mamba_ops.dll", "libmamba_ops.dll"]
-    elif sys.platform == "darwin":
-        lib_names = ["libmamba_ops.dylib", "libmamba_ops.so"]
-    else:
-        lib_names = ["libmamba_ops.so"]
-
-    # Search paths in order of priority
-    search_paths = [base_path]
-
-    # For editable installs, the .so is in site-packages/mamba_onnx/
-    # while __file__ points to the source directory
-    try:
-        import importlib.util
-        spec = importlib.util.find_spec("mamba_onnx")
-        if spec and spec.submodule_search_locations:
-            search_paths.extend(spec.submodule_search_locations)
-    except (ImportError, AttributeError):
-        pass
-
-    # Also check site-packages directly
-    for site_path in sys.path:
-        candidate = os.path.join(site_path, "mamba_onnx")
-        if os.path.isdir(candidate) and candidate not in search_paths:
-            search_paths.append(candidate)
-
-    # Search all paths for the library
-    for search_path in search_paths:
-        for name in lib_names:
-            lib_path = os.path.join(search_path, name)
-            if os.path.exists(lib_path):
-                return lib_path
-
-    # Return expected path for error message
-    return os.path.join(base_path, lib_names[0])
+# Library names by platform
+_LIB_NAMES = {
+    "win32": ["mamba_ops.dll", "libmamba_ops.dll"],
+    "darwin": ["libmamba_ops.dylib", "libmamba_ops.so"],
+    "linux": ["libmamba_ops.so"],
+}
 
 
-def register_custom_ops(session_options):
+def available_backends() -> list[str]:
+    """List available backends (cpp, zig)."""
+    backends = []
+    for name in _LIB_DIR.glob("libmamba_ops*.so"):
+        if "cpp" in name.name:
+            backends.append("cpp")
+        elif "zig" in name.name:
+            backends.append("zig")
+        elif name.name == "libmamba_ops.so":
+            # Default library - could be either
+            if "cpp" not in backends and "zig" not in backends:
+                backends.append("default")
+    return backends
+
+
+def get_library_path(backend: str = "auto") -> str:
     """
-    Registers the Mamba custom ops library with ONNX Runtime session options.
+    Get path to the compiled shared library.
+
+    Args:
+        backend: "cpp", "zig", or "auto" (tries default, then cpp, then zig)
+
+    Returns:
+        Path to the shared library
+
+    Raises:
+        FileNotFoundError: If no matching library is found
+    """
+    platform = "linux" if sys.platform.startswith("linux") else sys.platform
+    lib_names = _LIB_NAMES.get(platform, _LIB_NAMES["linux"])
+
+    # Backend-specific library names
+    if backend == "cpp":
+        candidates = ["libmamba_ops_cpp.so", "libmamba_ops.so"]
+    elif backend == "zig":
+        candidates = ["libmamba_ops_zig.so", "libmamba_ops.so"]
+    else:  # auto
+        candidates = ["libmamba_ops.so", "libmamba_ops_cpp.so", "libmamba_ops_zig.so"]
+
+    # Adjust for platform
+    if platform == "darwin":
+        candidates = [c.replace(".so", ".dylib") for c in candidates] + candidates
+    elif platform == "win32":
+        candidates = [c.replace("lib", "").replace(".so", ".dll") for c in candidates]
+
+    # Search in package directory
+    for name in candidates:
+        path = _LIB_DIR / name
+        if path.exists():
+            return str(path)
+
+    raise FileNotFoundError(
+        f"No mamba_ops library found in {_LIB_DIR}. "
+        f"Build with: zig build -Doptimize=ReleaseFast"
+    )
+
+
+def register_custom_ops(session_options, backend: str = "auto") -> str:
+    """
+    Register Mamba custom ops with ONNX Runtime session options.
 
     Args:
         session_options: An onnxruntime.SessionOptions instance
+        backend: "cpp", "zig", or "auto"
+
+    Returns:
+        Path to the library that was loaded (for logging)
 
     Example:
         >>> import onnxruntime as ort
         >>> import mamba_onnx
-        >>> sess_options = ort.SessionOptions()
-        >>> mamba_onnx.register_custom_ops(sess_options)
-        >>> session = ort.InferenceSession("model.onnx", sess_options)
+        >>> opts = ort.SessionOptions()
+        >>> lib = mamba_onnx.register_custom_ops(opts, backend="zig")
+        >>> print(f"Using: {lib}")
+        >>> session = ort.InferenceSession("model.onnx", opts)
     """
-    lib_path = get_library_path()
-    if not os.path.exists(lib_path):
-        raise FileNotFoundError(
-            f"Custom ops library not found at {lib_path}. "
-            f"Please ensure the package is properly installed with: pip install ."
-        )
-
+    lib_path = get_library_path(backend)
     session_options.register_custom_ops_library(lib_path)
+    return lib_path
 
 
-# Convenience exports
-__all__ = ["register_custom_ops", "get_library_path", "__version__"]
+__all__ = [
+    "register_custom_ops",
+    "get_library_path",
+    "available_backends",
+    "__version__",
+]

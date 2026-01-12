@@ -20,15 +20,14 @@ dev = [
 ]
 
 [build-system]
-requires = ["scikit-build-core>=0.5", "cmake>=3.18"]
-build-backend = "scikit_build_core.build"
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
 
-[tool.scikit-build]
-cmake.version = ">=3.18"
-cmake.build-type = "Release"
-# The wheel will contain the Python package + compiled .so
-wheel.packages = ["src/mamba_onnx"]
-wheel.install-dir = "mamba_onnx"
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+mamba_onnx = ["*.so", "*.dylib", "*.dll"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
