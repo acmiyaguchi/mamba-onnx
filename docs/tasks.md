@@ -20,9 +20,10 @@
 ## Phase 4: Optimization
 - [x] **Algebraic Simplification**: Refactor inner loop to use $h = h + \Delta(Ah + Bu)$ identity, reducing vector ops by 25%.
     - Result: **4x speedup** (0.28ms -> 0.07ms). See [docs/optimization_notes.md](optimization_notes.md).
-- [ ] **Fused Softplus and Z-Gate**: Fuse `Softplus(delta)` and `SiLU(z) * y` into the kernel to save memory bandwidth.
-    - Reference: `vendor/mamba/csrc/selective_scan/selective_scan_fwd_kernel.cuh` (lines 159-161 for Softplus, 285-303 for Z-Gate).
-    - Goal: Update ONNX schema and C++ kernel to handle raw inputs.
+- [x] **Fused Softplus and Z-Gate**: Fuse `Softplus(delta)` and `SiLU(z) * y` into the kernel.
+    - Implemented as 4 op variants: `SelectiveScan`, `SelectiveScanExact`, `SelectiveScanFused`, `SelectiveScanFusedExact`.
+    - Fusion adds ~30% latency overhead due to scalar exp/log in inner loop.
+    - See [docs/results.md](results.md) for benchmark comparisons.
 
 ## Phase 5: Comprehensive Benchmarking & Analysis
 - [x] **Extended Metrics**: Implement measurement of Throughput (tokens/s) and Peak Memory Usage.
