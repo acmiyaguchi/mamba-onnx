@@ -6,7 +6,9 @@
 #include <xmmintrin.h>
 #include <pmmintrin.h>
 #include <stdexcept>
+#ifdef _OPENMP
 #include <omp.h>
+#endif
 
 #include "onnxruntime_c_api.h"
 
