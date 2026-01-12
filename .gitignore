@@ -5,3 +5,4 @@ lib/
 .venv/
 __pycache__/
 *.so
+.zig-cache/

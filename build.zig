@@ -4,28 +4,25 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const backend = b.option(Backend, "backend", "Which backend to build (default: cpp)") orelse .cpp;
+    const backend = b.option(Backend, "backend", "Which backend to build (default: zig)") orelse .zig;
 
+    // Build the selected backend
     const lib = switch (backend) {
         .cpp => buildCpp(b, target, optimize),
         .zig => buildZig(b, target, optimize),
     };
-
     b.installArtifact(lib);
 
     // Convenience step to build both backends
     const both_step = b.step("both", "Build both cpp and zig backends");
-
     const cpp_lib = buildCpp(b, target, optimize);
     const zig_lib = buildZig(b, target, optimize);
-
     const cpp_install = b.addInstallArtifact(cpp_lib, .{
         .dest_sub_path = "libmamba_ops_cpp.so",
     });
     const zig_install = b.addInstallArtifact(zig_lib, .{
         .dest_sub_path = "libmamba_ops_zig.so",
     });
-
     both_step.dependOn(&cpp_install.step);
     both_step.dependOn(&zig_install.step);
 
@@ -46,7 +43,6 @@ fn buildCpp(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
 ) *std.Build.Step.Compile {
-    // Create a module for C++ compilation (no root source file)
     const mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
@@ -65,7 +61,8 @@ fn buildCpp(
             "-mfma",
             "-fno-signed-zeros",
             "-fno-trapping-math",
-            // Note: OpenMP disabled for now - add -fopenmp and link gomp if available
+            // OpenMP disabled - Zig's clang uses libomp (not installed by default)
+            // Use Zig backend for parallel execution instead
         },
     });
 

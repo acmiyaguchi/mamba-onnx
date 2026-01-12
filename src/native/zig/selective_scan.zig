@@ -1,6 +1,7 @@
 //! Mamba Selective Scan - Zig implementation
 //!
 //! AVX2-optimized selective scan kernel for ONNX Runtime.
+//! Features a warm thread pool for low-latency parallel execution.
 //! Build: zig build -Dbackend=zig -Doptimize=ReleaseFast
 
 const std = @import("std");
@@ -15,6 +16,182 @@ const c = @cImport({
 const Vec8 = @Vector(8, f32);
 const Vec8i = @Vector(8, i32);
 const Vec8u = @Vector(8, u32);
+
+// =============================================================================
+// Thread Pool
+// =============================================================================
+
+const MAX_THREADS = 32;
+
+/// Work function type - processes indices [start, end) with given context
+const WorkFn = *const fn (start: usize, end: usize, ctx: *anyopaque) void;
+
+/// Global thread pool for warm thread reuse
+/// Uses a generation-based synchronization to avoid races between work batches
+const ThreadPool = struct {
+    threads: [MAX_THREADS]std.Thread = undefined,
+    num_workers: usize = 0,
+
+    // Synchronization
+    mutex: std.Thread.Mutex = .{},
+    work_available: std.Thread.Condition = .{},
+    work_done: std.Thread.Condition = .{},
+
+    // Work specification (protected by mutex)
+    work_fn: ?WorkFn = null,
+    work_ctx: ?*anyopaque = null,
+    total_work: usize = 0,
+
+    // Generation counter to track work batches
+    generation: usize = 0,
+
+    // Atomic work counter for work-stealing
+    next_idx: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+
+    // Barrier for completion - counts down to 0
+    workers_remaining: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+
+    shutdown: bool = false,
+    initialized: bool = false,
+
+    fn init(self: *ThreadPool) void {
+        if (self.initialized) return;
+
+        const cpu_count = std.Thread.getCpuCount() catch 4;
+        self.num_workers = @min(cpu_count, MAX_THREADS) - 1; // -1 because main thread participates
+
+        // Spawn worker threads
+        for (0..self.num_workers) |i| {
+            self.threads[i] = std.Thread.spawn(.{}, workerLoop, .{self}) catch {
+                self.num_workers = i;
+                break;
+            };
+        }
+
+        self.initialized = true;
+    }
+
+    fn deinit(self: *ThreadPool) void {
+        if (!self.initialized) return;
+
+        // Signal shutdown
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.shutdown = true;
+        }
+        self.work_available.broadcast();
+
+        // Join all workers
+        for (0..self.num_workers) |i| {
+            self.threads[i].join();
+        }
+
+        self.initialized = false;
+    }
+
+    fn parallelFor(self: *ThreadPool, total: usize, work_fn: WorkFn, ctx: *anyopaque) void {
+        if (!self.initialized) self.init();
+
+        if (total == 0) return;
+
+        // For small work or single thread, run directly
+        if (self.num_workers == 0) {
+            work_fn(0, total, ctx);
+            return;
+        }
+
+        const num_participants = self.num_workers + 1; // +1 for main thread
+
+        // Setup work under lock
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            self.work_fn = work_fn;
+            self.work_ctx = ctx;
+            self.total_work = total;
+            self.next_idx.store(0, .release);
+            self.workers_remaining.store(num_participants, .release);
+            self.generation +%= 1;
+        }
+
+        // Wake workers
+        self.work_available.broadcast();
+
+        // Main thread participates in work
+        self.processWork(work_fn, ctx, total);
+
+        // Main thread signals completion
+        const remaining = self.workers_remaining.fetchSub(1, .acq_rel);
+        if (remaining == 1) {
+            // Main thread was the last one - we're done
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.work_fn = null;
+            return;
+        }
+
+        // Wait for workers to finish
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        while (self.workers_remaining.load(.acquire) > 0) {
+            self.work_done.wait(&self.mutex);
+        }
+        self.work_fn = null;
+    }
+
+    fn workerLoop(self: *ThreadPool) void {
+        var my_gen: usize = 0;
+
+        while (true) {
+            var work_fn: WorkFn = undefined;
+            var work_ctx: *anyopaque = undefined;
+            var total: usize = undefined;
+
+            // Wait for new work
+            {
+                self.mutex.lock();
+                defer self.mutex.unlock();
+
+                while ((self.generation == my_gen or self.work_fn == null) and !self.shutdown) {
+                    self.work_available.wait(&self.mutex);
+                }
+
+                if (self.shutdown) return;
+
+                // Capture work params and update our generation
+                my_gen = self.generation;
+                work_fn = self.work_fn.?;
+                work_ctx = self.work_ctx.?;
+                total = self.total_work;
+            }
+
+            // Process work
+            self.processWork(work_fn, work_ctx, total);
+
+            // Signal completion
+            const remaining = self.workers_remaining.fetchSub(1, .acq_rel);
+            if (remaining == 1) {
+                // Last worker - signal main thread
+                self.mutex.lock();
+                defer self.mutex.unlock();
+                self.work_done.signal();
+            }
+        }
+    }
+
+    fn processWork(self: *ThreadPool, work_fn: WorkFn, ctx: *anyopaque, total: usize) void {
+        // Work-stealing loop - grab one item at a time for good load balancing
+        while (true) {
+            const idx = self.next_idx.fetchAdd(1, .acq_rel);
+            if (idx >= total) break;
+            work_fn(idx, idx + 1, ctx);
+        }
+    }
+};
+
+var global_pool: ThreadPool = .{};
 
 // =============================================================================
 // Fast Math
@@ -65,15 +242,12 @@ fn fast_silu(x: f32) f32 {
 }
 
 // =============================================================================
-// Selective Scan Kernel (Parallel)
+// Selective Scan Kernel (Thread Pool)
 // =============================================================================
 
-const MAX_THREADS = 32;
-
-/// Work parameters shared across threads
-fn WorkParams(comptime use_fused: bool) type {
+/// Work context for parallel kernel execution
+fn KernelContext(comptime use_fused: bool, comptime use_exact: bool) type {
     return struct {
-        batch: usize,
         dim: usize,
         seqlen: usize,
         u_data: [*]const f32,
@@ -82,8 +256,35 @@ fn WorkParams(comptime use_fused: bool) type {
         B_data: [*]const f32,
         C_data: [*]const f32,
         D_data: [*]const f32,
-        z_data: if (use_fused) [*]const f32 else ?[*]const f32,
+        z_data: ?[*]const f32,
         out_data: [*]f32,
+
+        const Self = @This();
+
+        fn workFn(start: usize, end: usize, ctx_ptr: *anyopaque) void {
+            const self: *const Self = @ptrCast(@alignCast(ctx_ptr));
+            var idx = start;
+            while (idx < end) : (idx += 1) {
+                const b = idx / self.dim;
+                const d = idx % self.dim;
+                processOneDim(
+                    use_fused,
+                    use_exact,
+                    b,
+                    d,
+                    self.dim,
+                    self.seqlen,
+                    self.u_data,
+                    self.delta_data,
+                    self.A_data,
+                    self.B_data,
+                    self.C_data,
+                    self.D_data,
+                    self.z_data,
+                    self.out_data,
+                );
+            }
+        }
     };
 }
 
@@ -166,33 +367,6 @@ fn processOneDim(
     }
 }
 
-/// Worker thread function - processes a range of (batch*dim) indices
-fn workerFn(
-    comptime use_fused: bool,
-    comptime use_exact: bool,
-    start_idx: usize,
-    end_idx: usize,
-    batch: usize,
-    dim: usize,
-    seqlen: usize,
-    u_data: [*]const f32,
-    delta_data: [*]const f32,
-    A_data: [*]const f32,
-    B_data: [*]const f32,
-    C_data: [*]const f32,
-    D_data: [*]const f32,
-    z_data: ?[*]const f32,
-    out_data: [*]f32,
-) void {
-    _ = batch;
-    var idx = start_idx;
-    while (idx < end_idx) : (idx += 1) {
-        const b = idx / dim;
-        const d = idx % dim;
-        processOneDim(use_fused, use_exact, b, d, dim, seqlen, u_data, delta_data, A_data, B_data, C_data, D_data, z_data, out_data);
-    }
-}
-
 fn selectiveScanKernel(
     comptime use_fused: bool,
     comptime use_exact: bool,
@@ -210,60 +384,24 @@ fn selectiveScanKernel(
 ) void {
     const total_work = batch * dim;
 
-    // Estimate work per item (seqlen iterations with SIMD ops)
-    // Thread spawn overhead is ~10-50us, so we need enough work to amortize
-    const work_estimate = total_work * seqlen;
-    const MIN_WORK_PER_THREAD = 4096; // Minimum iterations per thread to be worth spawning
+    // Create kernel context on stack
+    const Ctx = KernelContext(use_fused, use_exact);
+    var ctx = Ctx{
+        .dim = dim,
+        .seqlen = seqlen,
+        .u_data = u_data,
+        .delta_data = delta_data,
+        .A_data = A_data,
+        .B_data = B_data,
+        .C_data = C_data,
+        .D_data = D_data,
+        .z_data = z_data,
+        .out_data = out_data,
+    };
 
-    // Get number of threads based on work size
-    const cpu_count = std.Thread.getCpuCount() catch 4;
-    const max_useful_threads = @max(1, work_estimate / MIN_WORK_PER_THREAD);
-    const num_threads = @min(@min(@min(cpu_count, MAX_THREADS), total_work), max_useful_threads);
-
-    // For small workloads or single thread, run directly
-    if (num_threads <= 1) {
-        for (0..batch) |b| {
-            for (0..dim) |d| {
-                processOneDim(use_fused, use_exact, b, d, dim, seqlen, u_data, delta_data, A_data, B_data, C_data, D_data, z_data, out_data);
-            }
-        }
-        return;
-    }
-
-    // Parallel execution - spawn (num_threads - 1) workers, main thread does work too
-    var threads: [MAX_THREADS]std.Thread = undefined;
-    const work_per_thread = total_work / num_threads;
-    const remainder = total_work % num_threads;
-
-    var start_idx: usize = 0;
-    const threads_to_spawn = num_threads - 1; // Main thread will do work too
-
-    for (0..threads_to_spawn) |t| {
-        const extra: usize = if (t < remainder) 1 else 0;
-        const end_idx = start_idx + work_per_thread + extra;
-
-        threads[t] = std.Thread.spawn(
-            .{},
-            workerFn,
-            .{ use_fused, use_exact, start_idx, end_idx, batch, dim, seqlen, u_data, delta_data, A_data, B_data, C_data, D_data, z_data, out_data },
-        ) catch {
-            // Fallback: run this chunk on main thread if spawn fails
-            workerFn(use_fused, use_exact, start_idx, end_idx, batch, dim, seqlen, u_data, delta_data, A_data, B_data, C_data, D_data, z_data, out_data);
-            continue;
-        };
-
-        start_idx = end_idx;
-    }
-
-    // Main thread processes remaining work
-    const main_extra: usize = if (threads_to_spawn < remainder) 1 else 0;
-    const main_end = start_idx + work_per_thread + main_extra;
-    workerFn(use_fused, use_exact, start_idx, main_end, batch, dim, seqlen, u_data, delta_data, A_data, B_data, C_data, D_data, z_data, out_data);
-
-    // Join spawned threads
-    for (0..threads_to_spawn) |t| {
-        threads[t].join();
-    }
+    // Use thread pool for parallel execution
+    // Each (batch, dim) pair is a work unit for good load balancing
+    global_pool.parallelFor(total_work, Ctx.workFn, @ptrCast(&ctx));
 }
 
 // =============================================================================
