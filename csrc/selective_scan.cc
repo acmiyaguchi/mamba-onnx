@@ -88,7 +88,7 @@ struct MambaSelectiveScanKernel {
         ORT_THROW_ON_ERROR(api_, api_.GetTensorMutableData(out_val, (void**)&out_data));
 
         if (dstate != 16) {
-            return;
+            throw std::runtime_error("Only dstate=16 is supported in this kernel");
         }
 
         #pragma omp parallel for collapse(2)

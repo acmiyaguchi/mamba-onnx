@@ -1,14 +1,26 @@
 [project]
 name = "mamba-onnx"
 version = "0.1.0"
-description = "Add your description here"
+description = "Mamba Selective Scan Custom Op for ONNX Runtime"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "numpy>=2.2.6",
-    "onnx>=1.20.1",
-    "onnxruntime>=1.23.2",
-    "onnxscript>=0.5.7",
-    "torch>=2.9.1",
-    "transformers>=4.57.3",
+    "numpy>=1.26.0",
+    "onnx>=1.14.0",
+    "onnxruntime>=1.16.0",
+    "torch>=2.0.0",
 ]
+
+[build-system]
+requires = ["scikit-build-core", "pybind11"]
+build-backend = "scikit_build_core.build"
+
+[tool.scikit-build]
+cmake.version = ">=3.18"
+cmake.source-dir = "csrc"
+# Install the library into the package directory
+wheel.packages = ["src/mamba_onnx"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"

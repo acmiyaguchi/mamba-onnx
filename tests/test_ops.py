@@ -2,20 +2,15 @@ import onnxruntime as ort
 import numpy as np
 import os
 import sys
+import mamba_onnx
 
 def test_custom_op():
     print("Testing Custom Op...")
     
-    # Path to library
-    lib_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../lib/libmamba_ops.so"))
-    if not os.path.exists(lib_path):
-        print(f"Library not found at {lib_path}")
-        return
-
-    print(f"Loading library: {lib_path}")
     sess_options = ort.SessionOptions()
     try:
-        sess_options.register_custom_ops_library(lib_path)
+        mamba_onnx.register_custom_ops(sess_options)
+        print("Library registered successfully.")
     except Exception as e:
         print(f"Failed to register library: {e}")
         return
