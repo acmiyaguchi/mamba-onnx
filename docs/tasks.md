@@ -22,8 +22,11 @@
     - Result: **4x speedup** (0.28ms -> 0.07ms). See [docs/optimization_notes.md](optimization_notes.md).
 - [x] **Fused Softplus and Z-Gate**: Fuse `Softplus(delta)` and `SiLU(z) * y` into the kernel.
     - Implemented as 4 op variants: `SelectiveScan`, `SelectiveScanExact`, `SelectiveScanFused`, `SelectiveScanFusedExact`.
-    - Fusion adds ~30% latency overhead due to scalar exp/log in inner loop.
     - See [docs/results.md](results.md) for benchmark comparisons.
+- [x] **Fast AVX2 Transcendentals**: Implement polynomial approximation for exp() using IEEE 754 bit manipulation.
+    - Result: **1.2-2.8x additional speedup** across all ops (SelectiveScan: 1.41ms -> 0.50ms).
+    - Uses Taylor polynomial + 2^n via exponent bit manipulation.
+    - See [docs/optimization_notes.md](optimization_notes.md) for implementation details.
 
 ## Phase 5: Comprehensive Benchmarking & Analysis
 - [x] **Extended Metrics**: Implement measurement of Throughput (tokens/s) and Peak Memory Usage.

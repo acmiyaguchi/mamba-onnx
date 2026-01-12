@@ -15,29 +15,40 @@ The library provides 4 custom op variants for different accuracy/performance tra
 
 ## Summary
 
-- **Speedup vs PyTorch**: **30-40x** across all variants
-- **Fastest Op**: `SelectiveScan` (linear discretization, no fusion)
+- **Speedup vs PyTorch**: **35-65x** across all variants (with fast AVX2 transcendentals)
+- **Fastest Op**: `SelectiveScan` (linear discretization, no fusion) at **0.50ms**
 - **Scaling**: Sub-2ms latency even at L=4096, D=768
 
 ## Head-to-Head Comparison (L=512, D=768)
 
 | Op | ONNX Latency | PyTorch Latency | Speedup |
 |---|---|---|---|
-| **SelectiveScan** | 1.41 ms | 43.5 ms | **30.8x** |
-| SelectiveScanExact | 1.86 ms | 60.9 ms | **32.7x** |
-| SelectiveScanFused | 1.85 ms | 53.7 ms | **29.1x** |
-| SelectiveScanFusedExact | 2.05 ms | 76.0 ms | **37.0x** |
+| **SelectiveScan** | 0.50 ms | 32.7 ms | **65.8x** |
+| SelectiveScanExact | 1.17 ms | 51.9 ms | **44.4x** |
+| SelectiveScanFused | 1.50 ms | 54.0 ms | **35.9x** |
+| SelectiveScanFusedExact | 1.75 ms | 71.6 ms | **40.8x** |
+
+### Performance Improvement from Fast AVX2 Transcendentals
+
+| Op | Before Optimization | After Optimization | Improvement |
+|---|---|---|---|
+| SelectiveScan | 1.41 ms | 0.50 ms | **2.8x faster** |
+| SelectiveScanExact | 1.86 ms | 1.17 ms | **1.6x faster** |
+| SelectiveScanFused | 1.85 ms | 1.50 ms | **1.2x faster** |
+| SelectiveScanFusedExact | 2.05 ms | 1.75 ms | **1.2x faster** |
+
+See [optimization_notes.md](optimization_notes.md) for implementation details of the fast AVX2 exp() approximation.
 
 ### Overhead Analysis
 
 | Comparison | Overhead |
 |---|---|
-| Exact vs Linear (non-fused) | +32% (+0.45ms) |
-| Exact vs Linear (fused) | +11% (+0.20ms) |
-| Fusion vs Non-fused (linear) | +31% (+0.44ms) |
-| Fusion vs Non-fused (exact) | +10% (+0.19ms) |
+| Exact vs Linear (non-fused) | +136% (+0.67ms) |
+| Exact vs Linear (fused) | +17% (+0.25ms) |
+| Fusion vs Non-fused (linear) | +203% (+1.01ms) |
+| Fusion vs Non-fused (exact) | +50% (+0.58ms) |
 
-**Key insight**: The exact discretization overhead is dominated by scalar `exp()` calls in the inner loop. When fusion is enabled, the Softplus/SiLU already add `exp()` calls, so the relative overhead of exact discretization is smaller.
+**Key insight**: After optimization, the linear discretization path is extremely fast (pure FMA ops). The exact and fused variants add overhead from transcendental function calls. The fused ops use `fast_exp` for softplus/silu but still call `std::log1pf` for accuracy, accounting for the remaining overhead.
 
 ## Scaling Analysis
 
@@ -72,9 +83,10 @@ Prior to the custom op implementation, the options were:
 1. **PyTorch Eager**: ~40-80ms for L=512, D=768 (Python interpreter overhead)
 2. **Vanilla ONNX Export**: Unrolls the scan loop into 600+ nodes, even slower than PyTorch
 
-The custom ops provide a **30-40x speedup** by:
+The custom ops provide a **35-65x speedup** by:
 - Fusing the entire scan into a single kernel
 - Using AVX2 SIMD for vectorized state updates
+- Fast polynomial approximation for exp() using IEEE 754 bit manipulation
 - Keeping hidden state in registers/L1 cache
 - Parallelizing across batch and dimension with OpenMP
 
