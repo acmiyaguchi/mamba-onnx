@@ -32,7 +32,13 @@ fn ensurePoolInit() void {
     pool_init_mutex.lock();
     defer pool_init_mutex.unlock();
     if (!pool_initialized) {
-        pool.init(.{ .allocator = std.heap.c_allocator }) catch return;
+        // Respect MAMBA_THREADS env var (0 or unset = use all cores)
+        const n_jobs: ?usize = blk: {
+            const val = std.posix.getenv("MAMBA_THREADS") orelse break :blk null;
+            const n = std.fmt.parseInt(usize, val, 10) catch break :blk null;
+            break :blk if (n == 0) null else n;
+        };
+        pool.init(.{ .allocator = std.heap.c_allocator, .n_jobs = n_jobs }) catch return;
         pool_initialized = true;
     }
 }

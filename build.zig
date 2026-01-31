@@ -1,5 +1,20 @@
 const std = @import("std");
 
+/// Try to locate the LLVM/Clang OpenMP include and lib directories.
+/// Returns (include_path, lib_path) or null if not found.
+/// Requires libomp-dev: `apt install libomp-dev`
+fn findOpenMP() ?struct { include: []const u8, lib: []const u8 } {
+    inline for (.{ 20, 19, 18, 17, 16, 15, 14 }) |ver| {
+        const s = std.fmt.comptimePrint("{d}", .{ver});
+        const include = "/usr/lib/llvm-" ++ s ++ "/lib/clang/" ++ s ++ "/include";
+        const lib = "/usr/lib/llvm-" ++ s ++ "/lib";
+        if (std.fs.accessAbsolute(include ++ "/omp.h", .{})) |_| {
+            return .{ .include = include, .lib = lib };
+        } else |_| {}
+    }
+    return null;
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -56,9 +71,24 @@ fn buildCpp(
 
     mod.addIncludePath(b.path("vendor/onnxruntime/include/onnxruntime/core/session"));
 
+    // OpenMP: auto-detect LLVM/Clang libomp (apt install libomp-dev)
+    const omp = findOpenMP();
+    if (omp) |paths| {
+        mod.addSystemIncludePath(.{ .cwd_relative = paths.include });
+        mod.addLibraryPath(.{ .cwd_relative = paths.lib });
+        mod.linkSystemLibrary("omp", .{});
+    }
+
     mod.addCSourceFile(.{
         .file = b.path("src/native/cpp/selective_scan.cc"),
-        .flags = &.{
+        .flags = if (omp != null) &.{
+            "-std=c++17",
+            "-mavx2",
+            "-mfma",
+            "-fno-signed-zeros",
+            "-fno-trapping-math",
+            "-fopenmp",
+        } else &.{
             "-std=c++17",
             "-mavx2",
             "-mfma",

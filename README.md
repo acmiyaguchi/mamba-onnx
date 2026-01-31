@@ -4,9 +4,9 @@ Optimized implementations of the Mamba Selective Scan operator for ONNX Runtime 
 
 ## Features
 
-- **Dual Backend**: Choose between C++ and Zig implementations.
+- **Dual Backend**: C++ (OpenMP) and Zig (warm thread pool) implementations, both multi-threaded.
 - **AVX2 Acceleration**: Hand-optimized SIMD for fast state updates.
-- **Parallel Execution**: Zig backend uses a warm thread pool for multi-core scaling.
+- **Parallel Execution**: Both backends parallelize across batch and dimension. Zig uses a warm thread pool; C++ uses OpenMP.
 - **Operator Fusion**: Replaces thousands of ONNX nodes with a single optimized kernel.
 - **4 Op Variants**: SelectiveScan, SelectiveScanExact, SelectiveScanFused, SelectiveScanFusedExact.
 
@@ -16,6 +16,7 @@ Optimized implementations of the Mamba Selective Scan operator for ONNX Runtime 
 - **Zig**: 0.14+ (build system and Zig backend)
 - **ONNX Runtime**: 1.16+ (installed via pip)
 - **C++ compiler** (optional, only for C++ backend): GCC 9+ or Clang with AVX2 support
+- **libomp-dev** (for C++ backend OpenMP): `apt install libomp-dev`
 
 ## Installation
 
@@ -24,8 +25,8 @@ Optimized implementations of the Mamba Selective Scan operator for ONNX Runtime 
 git clone https://github.com/your-repo/mamba-onnx.git
 cd mamba-onnx
 
-# Build the Zig backend (recommended)
-zig build -Dbackend=zig -Doptimize=ReleaseFast
+# Build both backends (C++ and Zig)
+zig build -Doptimize=ReleaseFast
 
 # Install the Python package
 pip install -e ".[dev]"
@@ -33,16 +34,6 @@ pip install -e ".[dev]"
 # Copy the built library into the package
 zig build install-py
 ```
-
-### Building both backends
-
-To build both the C++ and Zig backends for comparison:
-
-```bash
-zig build both -Doptimize=ReleaseFast
-```
-
-This produces `libmamba_ops_cpp` and `libmamba_ops_zig` in `zig-out/lib/`.
 
 ## Usage
 
@@ -80,10 +71,18 @@ python tests/test_ops.py
 
 ## Benchmarking
 
-Compare C++ and Zig backends (requires both to be built):
-
 ```bash
-python benchmarks/compare_backends.py
+# Compare all ops x both backends vs PyTorch reference
+python benchmarks/suite.py --mode compare --backend both --reps 100
+
+# Scaling analysis (L and D sweeps) with both backends
+python benchmarks/suite.py --mode scale --backend both --reps 100
+
+# Regenerate plots from CSV data
+python benchmarks/plot.py
+
+# Profile MambaBlock component breakdown
+python benchmarks/profiler.py
 ```
 
 ## Project Structure
