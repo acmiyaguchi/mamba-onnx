@@ -1,7 +1,7 @@
 //! Mamba Selective Scan - Zig implementation
 //!
 //! AVX2-optimized selective scan kernel for ONNX Runtime.
-//! Features a warm thread pool for low-latency parallel execution.
+//! Uses std.Thread.Pool for parallel execution.
 //! Build: zig build -Dbackend=zig -Doptimize=ReleaseFast
 
 const std = @import("std");
@@ -18,180 +18,48 @@ const Vec8i = @Vector(8, i32);
 const Vec8u = @Vector(8, u32);
 
 // =============================================================================
-// Thread Pool
+// Thread Pool (std.Thread.Pool)
 // =============================================================================
-
-const MAX_THREADS = 32;
 
 /// Work function type - processes indices [start, end) with given context
 const WorkFn = *const fn (start: usize, end: usize, ctx: *anyopaque) void;
 
-/// Global thread pool for warm thread reuse
-/// Uses a generation-based synchronization to avoid races between work batches
-const ThreadPool = struct {
-    threads: [MAX_THREADS]std.Thread = undefined,
-    num_workers: usize = 0,
+var pool: std.Thread.Pool = undefined;
+var pool_initialized: bool = false;
+var pool_init_mutex: std.Thread.Mutex = .{};
 
-    // Synchronization
-    mutex: std.Thread.Mutex = .{},
-    work_available: std.Thread.Condition = .{},
-    work_done: std.Thread.Condition = .{},
+fn ensurePoolInit() void {
+    pool_init_mutex.lock();
+    defer pool_init_mutex.unlock();
+    if (!pool_initialized) {
+        pool.init(.{ .allocator = std.heap.c_allocator }) catch return;
+        pool_initialized = true;
+    }
+}
 
-    // Work specification (protected by mutex)
-    work_fn: ?WorkFn = null,
-    work_ctx: ?*anyopaque = null,
-    total_work: usize = 0,
+fn runChunk(work_fn: WorkFn, start: usize, end: usize, ctx: *anyopaque) void {
+    work_fn(start, end, ctx);
+}
 
-    // Generation counter to track work batches
-    generation: usize = 0,
-
-    // Atomic work counter for work-stealing
-    next_idx: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-
-    // Barrier for completion - counts down to 0
-    workers_remaining: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-
-    shutdown: bool = false,
-    initialized: bool = false,
-
-    fn init(self: *ThreadPool) void {
-        if (self.initialized) return;
-
-        const cpu_count = std.Thread.getCpuCount() catch 4;
-        self.num_workers = @min(cpu_count, MAX_THREADS) - 1; // -1 because main thread participates
-
-        // Spawn worker threads
-        for (0..self.num_workers) |i| {
-            self.threads[i] = std.Thread.spawn(.{}, workerLoop, .{self}) catch {
-                self.num_workers = i;
-                break;
-            };
-        }
-
-        self.initialized = true;
+fn parallelFor(total: usize, work_fn: WorkFn, ctx: *anyopaque) void {
+    if (total == 0) return;
+    ensurePoolInit();
+    if (!pool_initialized) {
+        work_fn(0, total, ctx);
+        return;
     }
 
-    fn deinit(self: *ThreadPool) void {
-        if (!self.initialized) return;
+    var wg: std.Thread.WaitGroup = .{};
+    const n_threads = pool.threads.len + 1;
+    const chunk = (total + n_threads - 1) / n_threads;
 
-        // Signal shutdown
-        {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            self.shutdown = true;
-        }
-        self.work_available.broadcast();
-
-        // Join all workers
-        for (0..self.num_workers) |i| {
-            self.threads[i].join();
-        }
-
-        self.initialized = false;
+    var start: usize = 0;
+    while (start < total) : (start += chunk) {
+        const end = @min(start + chunk, total);
+        pool.spawnWg(&wg, runChunk, .{ work_fn, start, end, ctx });
     }
-
-    fn parallelFor(self: *ThreadPool, total: usize, work_fn: WorkFn, ctx: *anyopaque) void {
-        if (!self.initialized) self.init();
-
-        if (total == 0) return;
-
-        // For small work or single thread, run directly
-        if (self.num_workers == 0) {
-            work_fn(0, total, ctx);
-            return;
-        }
-
-        const num_participants = self.num_workers + 1; // +1 for main thread
-
-        // Setup work under lock
-        {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-
-            self.work_fn = work_fn;
-            self.work_ctx = ctx;
-            self.total_work = total;
-            self.next_idx.store(0, .release);
-            self.workers_remaining.store(num_participants, .release);
-            self.generation +%= 1;
-        }
-
-        // Wake workers
-        self.work_available.broadcast();
-
-        // Main thread participates in work
-        self.processWork(work_fn, ctx, total);
-
-        // Main thread signals completion
-        const remaining = self.workers_remaining.fetchSub(1, .acq_rel);
-        if (remaining == 1) {
-            // Main thread was the last one - we're done
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            self.work_fn = null;
-            return;
-        }
-
-        // Wait for workers to finish
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        while (self.workers_remaining.load(.acquire) > 0) {
-            self.work_done.wait(&self.mutex);
-        }
-        self.work_fn = null;
-    }
-
-    fn workerLoop(self: *ThreadPool) void {
-        var my_gen: usize = 0;
-
-        while (true) {
-            var work_fn: WorkFn = undefined;
-            var work_ctx: *anyopaque = undefined;
-            var total: usize = undefined;
-
-            // Wait for new work
-            {
-                self.mutex.lock();
-                defer self.mutex.unlock();
-
-                while ((self.generation == my_gen or self.work_fn == null) and !self.shutdown) {
-                    self.work_available.wait(&self.mutex);
-                }
-
-                if (self.shutdown) return;
-
-                // Capture work params and update our generation
-                my_gen = self.generation;
-                work_fn = self.work_fn.?;
-                work_ctx = self.work_ctx.?;
-                total = self.total_work;
-            }
-
-            // Process work
-            self.processWork(work_fn, work_ctx, total);
-
-            // Signal completion
-            const remaining = self.workers_remaining.fetchSub(1, .acq_rel);
-            if (remaining == 1) {
-                // Last worker - signal main thread
-                self.mutex.lock();
-                defer self.mutex.unlock();
-                self.work_done.signal();
-            }
-        }
-    }
-
-    fn processWork(self: *ThreadPool, work_fn: WorkFn, ctx: *anyopaque, total: usize) void {
-        // Work-stealing loop - grab one item at a time for good load balancing
-        while (true) {
-            const idx = self.next_idx.fetchAdd(1, .acq_rel);
-            if (idx >= total) break;
-            work_fn(idx, idx + 1, ctx);
-        }
-    }
-};
-
-var global_pool: ThreadPool = .{};
+    wg.wait();
+}
 
 // =============================================================================
 // Fast Math
@@ -401,7 +269,7 @@ fn selectiveScanKernel(
 
     // Use thread pool for parallel execution
     // Each (batch, dim) pair is a work unit for good load balancing
-    global_pool.parallelFor(total_work, Ctx.workFn, @ptrCast(&ctx));
+    parallelFor(total_work, Ctx.workFn, @ptrCast(&ctx));
 }
 
 // =============================================================================
@@ -436,7 +304,7 @@ fn computeKernel(kernel: ?*anyopaque, context: ?*c.OrtKernelContext) callconv(.c
     const api = state.api;
     const ctx = context orelse return;
 
-    // Get inputs
+    // Get inputs (check for null after each API call)
     var u_val: ?*const c.OrtValue = null;
     var delta_val: ?*const c.OrtValue = null;
     var A_val: ?*const c.OrtValue = null;
@@ -455,9 +323,15 @@ fn computeKernel(kernel: ?*anyopaque, context: ?*c.OrtKernelContext) callconv(.c
         _ = api.KernelContext_GetInput.?(ctx, 6, &z_val);
     }
 
+    // Bail out if any required input is null
+    if (u_val == null or delta_val == null or A_val == null or
+        B_val == null or C_val == null or D_val == null) return;
+    if (state.use_fused and z_val == null) return;
+
     // Get shape
     var u_info: ?*c.OrtTensorTypeAndShapeInfo = null;
     _ = api.GetTensorTypeAndShape.?(u_val, &u_info);
+    if (u_info == null) return;
     var u_dims: [3]i64 = undefined;
     _ = api.GetDimensions.?(u_info, &u_dims, 3);
     api.ReleaseTensorTypeAndShapeInfo.?(u_info);
@@ -485,12 +359,19 @@ fn computeKernel(kernel: ?*anyopaque, context: ?*c.OrtKernelContext) callconv(.c
         _ = api.GetTensorMutableData.?(@constCast(z_val), &z_data);
     }
 
+    // Bail out if any data pointer is null
+    if (u_data == null or delta_data == null or A_data == null or
+        B_data == null or C_data == null or D_data == null) return;
+    if (state.use_fused and z_data == null) return;
+
     // Create output
     var out_shape = [_]i64{ @intCast(batch), @intCast(dim), @intCast(seqlen) };
     var out_val: ?*c.OrtValue = null;
     _ = api.KernelContext_GetOutput.?(ctx, 0, &out_shape, 3, &out_val);
+    if (out_val == null) return;
     var out_data: ?*anyopaque = null;
     _ = api.GetTensorMutableData.?(out_val, &out_data);
+    if (out_data == null) return;
 
     // Cast pointers
     const u_ptr: [*]const f32 = @ptrCast(@alignCast(u_data));
