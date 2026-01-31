@@ -28,7 +28,7 @@ backend-path = ["."]
 where = ["src"]
 
 [tool.setuptools.package-data]
-mamba_onnx = ["*.so", "*.dylib", "*.dll"]
+mamba_onnx = ["libmamba_ops_*.so", "libmamba_ops_*.dylib", "mamba_ops_*.dll"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

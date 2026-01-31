@@ -1,8 +1,10 @@
 build/
-lib/
 *.onnx
 *.onnx.data
 .venv/
 __pycache__/
-*.so
 .zig-cache/
+zig-out/
+src/mamba_onnx/*.so
+src/mamba_onnx/*.dylib
+src/mamba_onnx/*.dll

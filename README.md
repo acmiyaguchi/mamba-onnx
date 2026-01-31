@@ -1,85 +1,101 @@
 # Mamba ONNX CPU Optimization
 
-This project provides a highly optimized C++ implementation of the Mamba Selective Scan operator, specifically designed for ONNX Runtime (CPU). By fusing the sequential recurrence into a single AVX2-accelerated kernel, it achieves significant speedups compared to standard PyTorch or naive ONNX implementations.
+Optimized implementations of the Mamba Selective Scan operator for ONNX Runtime (CPU). Fuses the sequential recurrence into a single AVX2-accelerated kernel for significant speedups over standard PyTorch or naive ONNX implementations.
 
 ## Features
 
-- **AVX2 Acceleration**: Hand-optimized intrinsics for fast state updates.
-- **Operator Fusion**: Replaces the expensive $O(L)$ loop in Python/ONNX with a single C++ node.
-- **Easy Integration**: Package-based installation with automatic ONNX Runtime registration.
-- **Verified Correctness**: Includes a benchmark suite that validates outputs against PyTorch's reference implementation.
+- **Dual Backend**: Choose between C++ and Zig implementations.
+- **AVX2 Acceleration**: Hand-optimized SIMD for fast state updates.
+- **Parallel Execution**: Zig backend uses a warm thread pool for multi-core scaling.
+- **Operator Fusion**: Replaces thousands of ONNX nodes with a single optimized kernel.
+- **4 Op Variants**: SelectiveScan, SelectiveScanExact, SelectiveScanFused, SelectiveScanFusedExact.
 
 ## Prerequisites
 
 - **Python**: 3.10+
-- **Compiler**: GCC 9+ or Clang (supporting AVX2 and OpenMP)
-- **CMake**: 3.18+
+- **Zig**: 0.14+ (build system and Zig backend)
+- **ONNX Runtime**: 1.16+ (installed via pip)
+- **C++ compiler** (optional, only for C++ backend): GCC 9+ or Clang with AVX2 support
 
 ## Installation
-
-The project uses `scikit-build-core` to manage the C++ compilation. You can install it in editable mode for development:
 
 ```bash
 # Clone the repository
 git clone https://github.com/your-repo/mamba-onnx.git
 cd mamba-onnx
 
-# Install in editable mode (triggers CMake build)
-pip install -e .
+# Build the Zig backend (recommended)
+zig build -Dbackend=zig -Doptimize=ReleaseFast
+
+# Install the Python package
+pip install -e ".[dev]"
+
+# Copy the built library into the package
+zig build install-py
 ```
 
-## Usage
+### Building both backends
 
-Registering the custom operator with ONNX Runtime is handled automatically by the `mamba_onnx` package:
+To build both the C++ and Zig backends for comparison:
+
+```bash
+zig build both -Doptimize=ReleaseFast
+```
+
+This produces `libmamba_ops_cpp` and `libmamba_ops_zig` in `zig-out/lib/`.
+
+## Usage
 
 ```python
 import onnxruntime as ort
 import mamba_onnx
 
-# Create session options
+# Create session options and register custom ops
 sess_options = ort.SessionOptions()
+mamba_onnx.register_custom_ops(sess_options, backend="zig")  # or "cpp", "auto"
 
-# Register the custom op
-mamba_onnx.register_custom_ops(sess_options)
-
-# Load your model (e.g., exported with the custom op)
-session = ort.InferenceSession("mamba_fused.onnx", sess_options, providers=['CPUExecutionProvider'])
+# Load your model
+session = ort.InferenceSession("model.onnx", sess_options, providers=['CPUExecutionProvider'])
 ```
 
-## Benchmarking Results
+### Selecting a backend
 
-By fusing the sequential recurrence into a single AVX2-accelerated kernel, we achieve over **100x speedup** compared to standard PyTorch and unrolled ONNX implementations.
+```python
+# List available backends
+print(mamba_onnx.available_backends())  # e.g. ['cpp', 'zig']
 
-### Performance Comparison ($L=128, D=768$)
+# Use a specific backend
+mamba_onnx.register_custom_ops(sess_options, backend="zig")
+```
 
-| Method | Latency | Speedup vs PyTorch |
-| :--- | :--- | :--- |
-| **PyTorch Eager** | 9.59 ms | 1.0x |
-| **Baseline ONNX** (Standard Ops) | 6.61 ms | ~1.45x |
-| **Fused ONNX** (Custom Kernel) | **0.08 ms** | **~122x** |
-
-### Why it's faster
-1. **Operator Fusion**: Replaces thousands of small ONNX nodes with one optimized kernel, eliminating dispatch overhead.
-2. **Register-Level State Updates**: Keeps intermediate states in CPU registers rather than writing back to main memory.
-3. **AVX2 SIMD**: Processes 8 channels simultaneously using 256-bit vector instructions.
-
-For detailed analysis, see [docs/results.md](docs/results.md).
-
-## Installation
-
-Run the test suite to ensure everything is working correctly:
+## Testing
 
 ```bash
+# Run tests with pytest
 pytest tests/
+
+# Or run standalone
+python tests/test_ops.py
+```
+
+## Benchmarking
+
+Compare C++ and Zig backends (requires both to be built):
+
+```bash
+python benchmarks/compare_backends.py
 ```
 
 ## Project Structure
 
-- `csrc/`: C++ source code for the optimized Selective Scan kernel.
+- `src/native/zig/`: Zig implementation of the selective scan kernel.
+- `src/native/cpp/`: C++ implementation of the selective scan kernel.
 - `src/mamba_onnx/`: Python package wrapper and library loader.
-- `benchmarks/`: Performance measurement scripts.
+- `vendor/onnxruntime/`: Vendored ONNX Runtime C API headers.
+- `benchmarks/`: Performance comparison scripts.
 - `tests/`: Correctness verification tests.
-- `vendor/`: Vendored headers for ONNX Runtime.
+- `build.zig`: Zig build system configuration.
+- `build_backend.py`: Python build backend for `pip install`.
 
 ## License
 

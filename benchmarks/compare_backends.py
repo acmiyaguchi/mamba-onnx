@@ -2,6 +2,7 @@
 """Compare C++ and Zig backends for correctness and performance."""
 
 import time
+import tempfile
 import numpy as np
 import onnxruntime as ort
 from onnx import helper, TensorProto
@@ -38,7 +39,7 @@ def create_model(op_name: str, D: int, N: int, use_fused: bool) -> str:
     )
     model.ir_version = 8
 
-    path = f"/tmp/{op_name.lower()}_bench.onnx"
+    path = os.path.join(tempfile.gettempdir(), f"{op_name.lower()}_bench.onnx")
     onnx.save(model, path)
     return path
 
