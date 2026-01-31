@@ -18,6 +18,7 @@ fn findOpenMP() ?struct { include: []const u8, lib: []const u8 } {
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const use_forkjoin = b.option(bool, "forkjoin", "Use ForkJoin instead of std.Thread.Pool (default: false)") orelse false;
 
     const ext = switch (target.result.os.tag) {
         .macos => ".dylib",
@@ -28,7 +29,7 @@ pub fn build(b: *std.Build) void {
 
     // Build both backends by default
     const cpp_lib = buildCpp(b, target, optimize);
-    const zig_lib = buildZig(b, target, optimize);
+    const zig_lib = buildZig(b, target, optimize, use_forkjoin);
 
     const cpp_install = b.addInstallArtifact(cpp_lib, .{
         .dest_sub_path = b.fmt("{s}mamba_ops_cpp{s}", .{ prefix, ext }),
@@ -110,7 +111,11 @@ fn buildZig(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
+    use_forkjoin: bool,
 ) *std.Build.Step.Compile {
+    const options = b.addOptions();
+    options.addOption(bool, "use_forkjoin", use_forkjoin);
+
     const mod = b.createModule(.{
         .root_source_file = b.path("src/native/zig/selective_scan.zig"),
         .target = target,
@@ -118,6 +123,7 @@ fn buildZig(
         .pic = true,
         .link_libc = true,
     });
+    mod.addOptions("build_options", options);
 
     mod.addIncludePath(b.path("vendor/onnxruntime/include/onnxruntime/core/session"));
 

@@ -1,8 +1,8 @@
 # Benchmarking Results
 
 This document summarizes the performance analysis of the Mamba Selective Scan custom operators.
-All benchmarks run with multi-threaded backends (C++ with OpenMP, Zig with a warm thread pool),
-batch size 1, 100 repetitions, median latency reported.
+All benchmarks run with multi-threaded backends (C++ with OpenMP, Zig with std.Thread.Pool),
+4 threads, batch size 1, 100 repetitions, median latency reported.
 
 ## Op Variants
 
@@ -17,111 +17,132 @@ The library provides 4 custom op variants for different accuracy/performance tra
 
 ## Summary
 
-- **Speedup vs PyTorch (C++ backend)**: **34-80x** across all variants
-- **Speedup vs PyTorch (Zig backend)**: **47-64x** across all variants
-- **Fastest Op**: `SelectiveScan` via C++ at **0.779ms** (B=1, D=768, L=1024)
-- **Scaling**: Sub-2.5ms latency on both backends even at L=4096, D=768 for non-fused ops
+- **Speedup vs PyTorch (C++ backend)**: **15-77x** across all variants
+- **Speedup vs PyTorch (Zig backend)**: **13-54x** across all variants
+- **Fastest Op**: `SelectiveScan` via C++ at **0.860ms** (B=1, D=768, L=1024)
+- **C++ leads across all ops**, with Zig within 0.67-0.93x
 
-## Head-to-Head Comparison (B=1, D=768, L=1024)
+## Head-to-Head Comparison (B=1, D=768, L=1024, 4 threads)
 
 | Op | C++ (ms) | Zig (ms) | PyTorch (ms) | C++ Speedup | Zig Speedup |
 |---|---|---|---|---|---|
-| **SelectiveScan** | **0.779** | 1.098 | 62.269 | **79.9x** | 56.7x |
-| SelectiveScanExact | 1.517 | **1.321** | 84.331 | 55.6x | **63.8x** |
-| SelectiveScanFused | 2.113 | **1.857** | 86.427 | 40.9x | **46.5x** |
-| SelectiveScanFusedExact | 3.305 | **1.984** | 112.836 | 34.1x | **56.9x** |
+| **SelectiveScan** | **0.860** | 1.216 | 65.927 | **76.7x** | 54.2x |
+| **SelectiveScanExact** | **1.871** | 2.798 | 88.900 | **47.5x** | 31.8x |
+| **SelectiveScanFused** | **5.882** | 6.337 | 91.319 | **15.5x** | 14.4x |
+| **SelectiveScanFusedExact** | **7.964** | 9.372 | 119.175 | **15.0x** | 12.7x |
 
 ## Backend Comparison: C++ vs Zig
 
-At L=1024, D=768, the two backends are competitive, with each winning on different ops:
+C++ wins across all ops. The gap is largest on the lighter ops where threading overhead
+is a larger fraction of total runtime.
 
 | Op | C++ (ms) | Zig (ms) | C++/Zig Ratio |
 |---|---|---|---|
-| SelectiveScan | **0.779** | 1.098 | **0.71x** |
-| SelectiveScanExact | 1.517 | **1.321** | 1.15x |
-| SelectiveScanFused | 2.113 | **1.857** | 1.14x |
-| SelectiveScanFusedExact | 3.305 | **1.984** | 1.67x |
+| SelectiveScan | **0.860** | 1.216 | 0.71x |
+| SelectiveScanExact | **1.871** | 2.798 | 0.67x |
+| SelectiveScanFused | **5.882** | 6.337 | 0.93x |
+| SelectiveScanFusedExact | **7.964** | 9.372 | 0.85x |
 
-**Analysis**: Both backends are now multi-threaded and parallelize across batch and dimension.
-C++ uses OpenMP fork-join threading; Zig uses a warm (pre-spawned) thread pool.
+**Analysis**: Both backends are multi-threaded and parallelize across batch and dimension.
+C++ uses OpenMP; Zig uses `std.Thread.Pool`.
 
-- **C++ wins on `SelectiveScan`** — This is a pure FMA-dominated op with minimal per-lane work.
-  OpenMP's fork-join has low enough overhead to beat the warm pool here.
-- **Zig wins on `SelectiveScanFusedExact`** — Heavier compute (exp, softplus, SiLU) per lane
-  amortizes the warm pool's constant overhead, and the pool avoids per-call fork-join costs.
-- **Roughly even on `Exact` and `Fused`** — Mid-weight ops where neither threading model has a
-  decisive advantage.
+- **C++ wins everywhere** — OpenMP's chunked static scheduling dispatches contiguous ranges
+  per thread with minimal overhead. Zig's pool has slightly higher per-dispatch cost.
+- **Gap narrows on heavier ops** — Fused ops (0.93x, 0.85x) close the gap because per-item
+  compute (exp, softplus, SiLU) dominates over threading overhead.
+- An experimental ForkJoin backend is available via `zig build -Dforkjoin=true` but
+  benchmarks show no measurable difference vs std.Thread.Pool at these workload sizes.
 
-## Scaling Analysis: Sequence Length (D=768)
+## Scaling Analysis: Sequence Length (D=768, 4 threads)
 
 ### C++ Backend
 
 | L | SelectiveScan | SelectiveScanExact | SelectiveScanFused | SelectiveScanFusedExact |
 |---|---|---|---|---|
-| 128 | 0.382 ms | 0.198 ms | 0.995 ms | 0.361 ms |
-| 256 | 0.194 ms | 0.380 ms | 0.635 ms | 1.132 ms |
-| 512 | 0.232 ms | 0.622 ms | 2.796 ms | 1.382 ms |
-| 1024 | 0.987 ms | 1.080 ms | 2.249 ms | 2.855 ms |
-| 2048 | 1.134 ms | 2.008 ms | 4.141 ms | 4.967 ms |
-| 4096 | 2.872 ms | 3.881 ms | 7.151 ms | 9.645 ms |
-
-*Note: C++ shows non-monotonic behavior at small L (128-256) due to OpenMP fork-join overhead.
-At small problem sizes the cost of spawning/synchronizing threads can exceed the compute savings,
-leading to inconsistent timings. This effect disappears at L≥512 where per-lane work dominates.*
+| 128 | 0.122 ms | 0.247 ms | 0.694 ms | 0.995 ms |
+| 256 | 0.228 ms | 0.485 ms | 1.411 ms | 2.000 ms |
+| 512 | 0.440 ms | 0.950 ms | 2.777 ms | 4.079 ms |
+| 1024 | 0.923 ms | 1.897 ms | 5.508 ms | 7.935 ms |
+| 2048 | 1.742 ms | 3.770 ms | 11.088 ms | 16.258 ms |
+| 4096 | 3.396 ms | 7.414 ms | 25.346 ms | 31.195 ms |
 
 ### Zig Backend
 
 | L | SelectiveScan | SelectiveScanExact | SelectiveScanFused | SelectiveScanFusedExact |
 |---|---|---|---|---|
-| 128 | 0.458 ms | 0.397 ms | 0.454 ms | 0.513 ms |
-| 256 | 0.423 ms | 0.432 ms | 0.539 ms | 0.612 ms |
-| 512 | 0.424 ms | 0.509 ms | 0.803 ms | 1.011 ms |
-| 1024 | 0.478 ms | 0.781 ms | 1.494 ms | 1.855 ms |
-| 2048 | 0.747 ms | 1.257 ms | 2.717 ms | 3.762 ms |
-| 4096 | 1.312 ms | 2.449 ms | 5.367 ms | 7.275 ms |
+| 128 | 0.217 ms | 0.415 ms | 0.847 ms | 1.220 ms |
+| 256 | 0.352 ms | 0.743 ms | 1.630 ms | 2.400 ms |
+| 512 | 0.641 ms | 1.416 ms | 3.256 ms | 4.753 ms |
+| 1024 | 1.217 ms | 2.796 ms | 6.379 ms | 9.358 ms |
+| 2048 | 2.406 ms | 5.519 ms | 12.752 ms | 18.775 ms |
+| 4096 | 4.867 ms | 11.114 ms | 25.400 ms | 37.158 ms |
 
-*All variants scale linearly with sequence length as expected (O(L) complexity).
-Zig's warm thread pool provides smooth, monotonic scaling even at small L, since the pool
-is pre-spawned and avoids per-call fork-join overhead. Even at L=4096, the non-fused ops
-stay under 2.5ms.*
+*Both backends scale linearly with sequence length as expected (O(L) complexity).
+Non-fused ops stay under 5ms even at L=4096 on C++.*
 
-## Scaling Analysis: Model Dimension (L=1024, Zig Backend)
+## Scaling Analysis: Model Dimension (L=1024, 4 threads)
+
+### C++ Backend
 
 | D | SelectiveScan | SelectiveScanExact | SelectiveScanFused | SelectiveScanFusedExact |
 |---|---|---|---|---|
-| 256 | 0.398 ms | 0.504 ms | 0.611 ms | 0.755 ms |
-| 512 | 0.412 ms | 0.550 ms | 1.009 ms | 1.342 ms |
-| 768 | 0.541 ms | 0.778 ms | 1.468 ms | 1.890 ms |
-| 1024 | 0.576 ms | 0.976 ms | 2.018 ms | 2.890 ms |
-| 1536 | 0.769 ms | 1.465 ms | 2.949 ms | 3.847 ms |
-| 2048 | 0.974 ms | 1.732 ms | 3.716 ms | 5.005 ms |
+| 256 | 0.323 ms | 0.630 ms | 1.802 ms | 2.582 ms |
+| 512 | 0.570 ms | 1.245 ms | 3.589 ms | 5.146 ms |
+| 768 | 0.860 ms | 3.004 ms | 5.502 ms | 7.822 ms |
+| 1024 | 1.168 ms | 2.483 ms | 7.473 ms | 10.434 ms |
+| 1536 | 1.720 ms | 3.729 ms | 11.200 ms | 15.617 ms |
+| 2048 | 2.290 ms | 4.928 ms | 14.360 ms | 21.464 ms |
 
-*Dimension scaling is sub-linear for the lighter ops thanks to the thread pool —
-`SelectiveScan` only goes from 0.398ms to 0.974ms as D grows 8x (256 to 2048).
-Heavier fused ops show closer-to-linear scaling as per-lane compute dominates.*
+### Zig Backend
+
+| D | SelectiveScan | SelectiveScanExact | SelectiveScanFused | SelectiveScanFusedExact |
+|---|---|---|---|---|
+| 256 | 0.451 ms | 0.961 ms | 2.157 ms | 3.157 ms |
+| 512 | 0.834 ms | 1.872 ms | 4.296 ms | 6.282 ms |
+| 768 | 1.244 ms | 2.837 ms | 6.376 ms | 9.472 ms |
+| 1024 | 1.611 ms | 3.713 ms | 8.500 ms | 12.506 ms |
+| 1536 | 2.386 ms | 5.539 ms | 13.012 ms | 18.864 ms |
+| 2048 | 3.200 ms | 7.352 ms | 16.885 ms | 25.022 ms |
+
+*Dimension scaling is sub-linear for the lighter ops thanks to multi-threading —
+`SelectiveScan` (C++) only goes from 0.323ms to 2.290ms as D grows 8x (256 to 2048).*
 
 ## Historical Context
 
 Prior to the custom op implementation, the options were:
 
-1. **PyTorch Eager**: ~62-113ms for L=1024, D=768 (Python interpreter overhead, no fusion)
+1. **PyTorch Eager**: ~62-119ms for L=1024, D=768 (Python interpreter overhead, no fusion)
 2. **Vanilla ONNX Export**: Unrolls the scan loop into 600+ nodes, even slower than PyTorch
 
 The custom ops (both backends) provide massive speedups by:
 - Fusing the entire scan into a single kernel
-- Using SIMD vectorization (AVX2 in C++, auto-vectorization in Zig) for state updates
+- Using AVX2 SIMD vectorization for state updates
 - Fast polynomial approximation for exp() using IEEE 754 bit manipulation
 - Keeping hidden state in registers/L1 cache
-- **Both backends**: Parallelizing across batch and dimension (C++ via OpenMP, Zig via warm thread pool)
+- Parallelizing across batch and dimension (C++ via OpenMP, Zig via std.Thread.Pool)
+
+## Reproducing
+
+```bash
+# Build both backends
+zig build -Doptimize=ReleaseFast
+
+# Head-to-head comparison (4 threads, 100 reps)
+python benchmarks/suite.py --mode compare --backend both --threads 4 --reps 100
+
+# Scaling analysis
+python benchmarks/suite.py --mode scale --backend both --threads 4 --reps 100
+
+# Regenerate plots
+python benchmarks/plot.py
+```
 
 ## Recommendations
 
 | Use Case | Recommended Op | Recommended Backend |
 |---|---|---|
-| Maximum throughput (light ops) | `SelectiveScan` | C++ |
-| Maximum throughput (fused ops) | `SelectiveScanFused` or `SelectiveScanFusedExact` | Zig |
-| Numerical accuracy required | `SelectiveScanExact` | Either |
-| Full Mamba block integration | `SelectiveScanFused` or `SelectiveScanFusedExact` | Zig |
-| Minimal dependencies / portability | Any | C++ |
-| Smooth latency at small sequence lengths | Any | Zig |
+| Maximum throughput | `SelectiveScan` | C++ |
+| Numerical accuracy required | `SelectiveScanExact` | C++ |
+| Full Mamba block integration | `SelectiveScanFusedExact` | C++ |
+| Minimal dependencies / portability | Any | Zig |
 | Research/debugging | `SelectiveScanExact` | Either (matches PyTorch exactly) |

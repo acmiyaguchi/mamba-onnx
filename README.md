@@ -4,9 +4,9 @@ Optimized implementations of the Mamba Selective Scan operator for ONNX Runtime 
 
 ## Features
 
-- **Dual Backend**: C++ (OpenMP) and Zig (warm thread pool) implementations, both multi-threaded.
+- **Dual Backend**: C++ (OpenMP) and Zig (std.Thread.Pool) implementations, both multi-threaded.
 - **AVX2 Acceleration**: Hand-optimized SIMD for fast state updates.
-- **Parallel Execution**: Both backends parallelize across batch and dimension. Zig uses a warm thread pool; C++ uses OpenMP.
+- **Parallel Execution**: Both backends parallelize across batch and dimension. C++ uses OpenMP; Zig uses std.Thread.Pool (or optional ForkJoin with `-Dforkjoin=true`).
 - **Operator Fusion**: Replaces thousands of ONNX nodes with a single optimized kernel.
 - **4 Op Variants**: SelectiveScan, SelectiveScanExact, SelectiveScanFused, SelectiveScanFusedExact.
 

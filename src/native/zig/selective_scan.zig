@@ -1,10 +1,10 @@
 //! Mamba Selective Scan - Zig implementation
 //!
 //! AVX2-optimized selective scan kernel for ONNX Runtime.
-//! Uses std.Thread.Pool for parallel execution.
-//! Build: zig build -Dbackend=zig -Doptimize=ReleaseFast
+//! Build: zig build -Doptimize=ReleaseFast [-Dforkjoin=true]
 
 const std = @import("std");
+const build_options = @import("build_options");
 const c = @cImport({
     @cInclude("onnxruntime_c_api.h");
 });
@@ -18,11 +18,22 @@ const Vec8i = @Vector(8, i32);
 const Vec8u = @Vector(8, u32);
 
 // =============================================================================
-// Thread Pool (std.Thread.Pool)
+// Parallel dispatch (compile-time selectable)
 // =============================================================================
 
 /// Work function type - processes indices [start, end) with given context
 const WorkFn = *const fn (start: usize, end: usize, ctx: *anyopaque) void;
+
+/// Read MAMBA_THREADS env var (0 or unset = use all cores)
+fn getRequestedThreads() ?usize {
+    const val = std.posix.getenv("MAMBA_THREADS") orelse return null;
+    const n = std.fmt.parseInt(usize, val, 10) catch return null;
+    return if (n == 0) null else n;
+}
+
+// ---------------------------------------------------------------------------
+// Option A: std.Thread.Pool (default) — simple, battle-tested
+// ---------------------------------------------------------------------------
 
 var pool: std.Thread.Pool = undefined;
 var pool_initialized: bool = false;
@@ -32,13 +43,7 @@ fn ensurePoolInit() void {
     pool_init_mutex.lock();
     defer pool_init_mutex.unlock();
     if (!pool_initialized) {
-        // Respect MAMBA_THREADS env var (0 or unset = use all cores)
-        const n_jobs: ?usize = blk: {
-            const val = std.posix.getenv("MAMBA_THREADS") orelse break :blk null;
-            const n = std.fmt.parseInt(usize, val, 10) catch break :blk null;
-            break :blk if (n == 0) null else n;
-        };
-        pool.init(.{ .allocator = std.heap.c_allocator, .n_jobs = n_jobs }) catch return;
+        pool.init(.{ .allocator = std.heap.c_allocator, .n_jobs = getRequestedThreads() }) catch return;
         pool_initialized = true;
     }
 }
@@ -47,7 +52,7 @@ fn runChunk(work_fn: WorkFn, start: usize, end: usize, ctx: *anyopaque) void {
     work_fn(start, end, ctx);
 }
 
-fn parallelFor(total: usize, work_fn: WorkFn, ctx: *anyopaque) void {
+fn poolParallelFor(total: usize, work_fn: WorkFn, ctx: *anyopaque) void {
     if (total == 0) return;
     ensurePoolInit();
     if (!pool_initialized) {
@@ -65,6 +70,142 @@ fn parallelFor(total: usize, work_fn: WorkFn, ctx: *anyopaque) void {
         pool.spawnWg(&wg, runChunk, .{ work_fn, start, end, ctx });
     }
     wg.wait();
+}
+
+// ---------------------------------------------------------------------------
+// Option B: ForkJoin — zero-allocation, futex-based, main participates
+// ---------------------------------------------------------------------------
+
+const MAX_WORKERS = 31; // + 1 main thread = 32 max participants
+
+const ForkJoin = struct {
+    threads: [MAX_WORKERS]std.Thread = undefined,
+    num_workers: u32 = 0,
+    work_fn: WorkFn = undefined,
+    work_ctx: *anyopaque = undefined,
+    total_work: usize = 0,
+    next_idx: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    gen: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    done: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    ready: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    stop: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+    fn init(self: *ForkJoin) void {
+        const cpu_count = std.Thread.getCpuCount() catch 1;
+        const total_threads = if (getRequestedThreads()) |r| @min(r, MAX_WORKERS + 1) else @min(cpu_count, MAX_WORKERS + 1);
+        self.num_workers = @intCast(if (total_threads > 1) total_threads - 1 else 0);
+
+        for (0..self.num_workers) |i| {
+            self.threads[i] = std.Thread.spawn(.{}, workerLoop, .{ self, i }) catch {
+                self.num_workers = @intCast(i);
+                break;
+            };
+        }
+
+        // Wait for all workers to reach their initial park point
+        while (self.ready.load(.acquire) < self.num_workers) {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    fn deinit(self: *ForkJoin) void {
+        self.stop.store(1, .release);
+        _ = self.gen.fetchAdd(1, .release);
+        std.Thread.Futex.wake(&self.gen, MAX_WORKERS);
+        for (0..self.num_workers) |i| {
+            self.threads[i].join();
+        }
+    }
+
+    fn dispatch(self: *ForkJoin, total: usize, work_fn: WorkFn, ctx: *anyopaque) void {
+        const num_participants = self.num_workers + 1;
+
+        self.work_fn = work_fn;
+        self.work_ctx = ctx;
+        self.total_work = total;
+        self.next_idx.store(0, .monotonic);
+        self.done.store(0, .monotonic);
+
+        _ = self.gen.fetchAdd(1, .release);
+        std.Thread.Futex.wake(&self.gen, MAX_WORKERS);
+
+        self.doWork(work_fn, ctx, total);
+
+        const prev_done = self.done.fetchAdd(1, .release);
+        if (prev_done + 1 < num_participants) {
+            while (true) {
+                const current_done = self.done.load(.acquire);
+                if (current_done >= num_participants) break;
+                std.Thread.Futex.wait(&self.done, current_done);
+            }
+        }
+    }
+
+    fn doWork(self: *ForkJoin, work_fn: WorkFn, ctx: *anyopaque, total: usize) void {
+        while (true) {
+            const idx = self.next_idx.fetchAdd(1, .monotonic);
+            if (idx >= total) break;
+            work_fn(idx, idx + 1, ctx);
+        }
+    }
+
+    fn workerLoop(self: *ForkJoin, _: usize) void {
+        var my_gen: u32 = self.gen.load(.acquire);
+        _ = self.ready.fetchAdd(1, .release);
+        while (true) {
+            std.Thread.Futex.wait(&self.gen, my_gen);
+            const new_gen = self.gen.load(.acquire);
+            if (new_gen == my_gen) continue;
+            my_gen = new_gen;
+
+            if (self.stop.load(.acquire) != 0) return;
+
+            const work_fn = self.work_fn;
+            const ctx = self.work_ctx;
+            const total = self.total_work;
+
+            self.doWork(work_fn, ctx, total);
+
+            const num_participants = self.num_workers + 1;
+            const prev_done = self.done.fetchAdd(1, .release);
+            if (prev_done + 1 >= num_participants) {
+                std.Thread.Futex.wake(&self.done, 1);
+            }
+        }
+    }
+};
+
+var fork_join: ForkJoin = .{};
+var fj_init_mutex: std.Thread.Mutex = .{};
+var fj_initialized: bool = false;
+
+fn forkJoinParallelFor(total: usize, work_fn: WorkFn, ctx: *anyopaque) void {
+    if (total == 0) return;
+    fj_init_mutex.lock();
+    if (!fj_initialized) {
+        fork_join.init();
+        fj_initialized = true;
+    }
+    fj_init_mutex.unlock();
+    if (fork_join.num_workers == 0) {
+        work_fn(0, total, ctx);
+        return;
+    }
+    fork_join.dispatch(total, work_fn, ctx);
+}
+
+// ---------------------------------------------------------------------------
+// Unified entry point
+// ---------------------------------------------------------------------------
+
+const use_forkjoin = if (@hasDecl(@This(), "build_options")) build_options.use_forkjoin else false;
+
+fn parallelFor(total: usize, work_fn: WorkFn, ctx: *anyopaque) void {
+    if (use_forkjoin) {
+        forkJoinParallelFor(total, work_fn, ctx);
+    } else {
+        poolParallelFor(total, work_fn, ctx);
+    }
 }
 
 // =============================================================================
@@ -116,7 +257,7 @@ fn fast_silu(x: f32) f32 {
 }
 
 // =============================================================================
-// Selective Scan Kernel (Thread Pool)
+// Selective Scan Kernel (ForkJoin)
 // =============================================================================
 
 /// Work context for parallel kernel execution
