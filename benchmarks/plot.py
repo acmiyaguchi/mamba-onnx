@@ -1,188 +1,308 @@
 """
-Plotting utilities for Mamba custom op benchmarks.
+Plotting utilities for Mamba custom-op benchmarks.
 
-Generates visualizations for all 4 op variants:
-  - SelectiveScan (linear, fastest)
-  - SelectiveScanExact (exact discretization)
-  - SelectiveScanFused (linear + Softplus/SiLU)
-  - SelectiveScanFusedExact (exact + Softplus/SiLU)
+Reads pytest-benchmark JSON output and generates PNG plots.
+
+Usage:
+    # From saved benchmark results:
+    pytest benchmarks/ --benchmark-only --benchmark-save=run1
+    python benchmarks/plot.py
+
+    # Or specify a JSON file directly:
+    python benchmarks/plot.py --input .benchmarks/Linux-CPython-.../0001_run1.json
 """
-import pandas as pd
-import matplotlib.pyplot as plt
-import numpy as np
+import argparse
+import glob
+import json
 import os
 
-# Op configuration
-OPS = ['SelectiveScan', 'SelectiveScanExact', 'SelectiveScanFused', 'SelectiveScanFusedExact']
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+# ---------------------------------------------------------------------------
+# Style constants
+# ---------------------------------------------------------------------------
+OPS = ["SelectiveScan", "SelectiveScanExact", "SelectiveScanFused", "SelectiveScanFusedExact"]
 OP_COLORS = {
-    'SelectiveScan': '#4CAF50',        # Green (fastest)
-    'SelectiveScanExact': '#2196F3',   # Blue
-    'SelectiveScanFused': '#FF9800',   # Orange
-    'SelectiveScanFusedExact': '#9C27B0',  # Purple
+    "SelectiveScan": "#4CAF50",
+    "SelectiveScanExact": "#2196F3",
+    "SelectiveScanFused": "#FF9800",
+    "SelectiveScanFusedExact": "#9C27B0",
 }
 OP_LABELS = {
-    'SelectiveScan': 'Linear (fastest)',
-    'SelectiveScanExact': 'Exact',
-    'SelectiveScanFused': 'Linear + Fused',
-    'SelectiveScanFusedExact': 'Exact + Fused',
+    "SelectiveScan": "Linear (fastest)",
+    "SelectiveScanExact": "Exact",
+    "SelectiveScanFused": "Linear + Fused",
+    "SelectiveScanFusedExact": "Exact + Fused",
 }
+BACKEND_COLORS = {"cpp": "#E53935", "zig": "#1E88E5"}
+BACKEND_STYLES = {"zig": "-", "cpp": "--"}
 
 
-def plot_scaling_L(df):
-    """Plot latency vs sequence length for all 4 ops."""
-    df_L = df[df['Scenario'] == 'Scaling_L']
-    if df_L.empty:
-        print("No Scaling_L data found.")
+# ---------------------------------------------------------------------------
+# Data loading
+# ---------------------------------------------------------------------------
+
+def _find_latest_json(benchmarks_dir=".benchmarks"):
+    """Find the most recently modified JSON file in the .benchmarks tree."""
+    pattern = os.path.join(benchmarks_dir, "**", "*.json")
+    files = glob.glob(pattern, recursive=True)
+    if not files:
+        return None
+    return max(files, key=os.path.getmtime)
+
+
+def _load_benchmark_json(path):
+    """Load a pytest-benchmark JSON file and return a DataFrame."""
+    with open(path) as f:
+        data = json.load(f)
+
+    rows = []
+    for bench in data.get("benchmarks", []):
+        stats = bench.get("stats", {})
+        extra = bench.get("extra_info", {})
+        rows.append({
+            "name": bench.get("name", ""),
+            "group": bench.get("group", ""),
+            "latency_ms": stats.get("mean", 0) * 1000,
+            "median_ms": stats.get("median", 0) * 1000,
+            "stddev_ms": stats.get("stddev", 0) * 1000,
+            "min_ms": stats.get("min", 0) * 1000,
+            "op": extra.get("op", ""),
+            "backend": extra.get("backend", ""),
+            "scenario": extra.get("scenario", ""),
+            "L": extra.get("L", 0),
+            "D": extra.get("D", 0),
+            "B": extra.get("B", 0),
+        })
+
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Plots
+# ---------------------------------------------------------------------------
+
+def _plot_scaling(df, axis_col, fixed_col, fixed_val, scenario_label, output_dir):
+    """Scaling plot with one subplot per backend."""
+    sub = df[df["scenario"] == scenario_label]
+    if sub.empty:
+        print(f"No {scenario_label} data found, skipping.")
         return
 
-    plt.figure(figsize=(12, 7))
+    backends = sorted(sub["backend"].unique())
+    n = len(backends)
+    if n == 0:
+        return
 
-    for op in OPS:
-        col = f'{op}_ms'
-        if col in df_L.columns:
-            plt.plot(df_L['L'], df_L[col], marker='o',
+    fig, axes = plt.subplots(1, n, figsize=(7 * n, 6), sharey=True, squeeze=False)
+    axes = axes[0]
+
+    for ax, backend in zip(axes, backends):
+        for op in OPS:
+            mask = (sub["op"] == op) & (sub["backend"] == backend)
+            chunk = sub[mask].sort_values(axis_col)
+            if chunk.empty:
+                continue
+            ax.plot(chunk[axis_col], chunk["median_ms"], marker="o",
                     color=OP_COLORS[op], label=OP_LABELS[op], linewidth=2)
+            ax.fill_between(
+                chunk[axis_col],
+                chunk["median_ms"] - chunk["stddev_ms"],
+                chunk["median_ms"] + chunk["stddev_ms"],
+                color=OP_COLORS[op], alpha=0.15,
+            )
+        ax.set_xlabel(axis_col, fontsize=12)
+        ax.set_title(f"{backend} ({fixed_col}={fixed_val})", fontsize=13)
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=9)
 
-    plt.xlabel('Sequence Length (L)', fontsize=12)
-    plt.ylabel('Latency (ms)', fontsize=12)
-    plt.title('Mamba Selective Scan Latency vs Sequence Length (D=768)', fontsize=14)
-    plt.grid(True, alpha=0.3)
-    plt.legend(fontsize=10)
+    axes[0].set_ylabel("Median Latency (ms)", fontsize=12)
+    fig.suptitle(f"Selective Scan Latency vs {axis_col}", fontsize=14, y=1.02)
     plt.tight_layout()
-    plt.savefig("benchmarks/results/scaling_L.png", dpi=150)
-    print("Saved benchmarks/results/scaling_L.png")
+    fname = os.path.join(output_dir, f"scaling_{axis_col}.png")
+    plt.savefig(fname, dpi=150, bbox_inches="tight")
+    print(f"Saved {fname}")
     plt.close()
 
 
-def plot_scaling_D(df):
-    """Plot latency vs model dimension for all 4 ops."""
-    df_D = df[df['Scenario'] == 'Scaling_D']
-    if df_D.empty:
-        print("No Scaling_D data found.")
+def plot_scaling_L(df, output_dir):
+    _plot_scaling(df, "L", "D", 768, "Scaling_L", output_dir)
+
+
+def plot_scaling_D(df, output_dir):
+    _plot_scaling(df, "D", "L", 1024, "Scaling_D", output_dir)
+
+
+def plot_speedup(df, output_dir):
+    """Grouped bar chart: ONNX speedup vs PyTorch for each op, by backend."""
+    onnx = df[df["group"] == "compare-onnx"]
+    pytorch = df[df["group"] == "compare-pytorch"]
+    if onnx.empty or pytorch.empty:
+        print("No compare data for speedup chart, skipping.")
         return
 
-    plt.figure(figsize=(12, 7))
+    pt_lookup = pytorch.groupby("op")["median_ms"].median().to_dict()
 
-    for op in OPS:
-        col = f'{op}_ms'
-        if col in df_D.columns:
-            plt.plot(df_D['D'], df_D[col], marker='s',
-                    color=OP_COLORS[op], label=OP_LABELS[op], linewidth=2)
+    backends = sorted(onnx["backend"].unique())
+    n_ops = len(OPS)
+    bar_width = 0.35
+    x = np.arange(n_ops)
 
-    plt.xlabel('Model Dimension (D)', fontsize=12)
-    plt.ylabel('Latency (ms)', fontsize=12)
-    plt.title('Mamba Selective Scan Latency vs Model Dimension (L=1024)', fontsize=14)
-    plt.grid(True, alpha=0.3)
-    plt.legend(fontsize=10)
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(11, 9), gridspec_kw={"height_ratios": [2, 1]})
+
+    # --- Top: speedup bars ---
+    for i, backend in enumerate(backends):
+        speedups = []
+        for op in OPS:
+            row = onnx[(onnx["op"] == op) & (onnx["backend"] == backend)]
+            onnx_ms = row["median_ms"].values[0] if not row.empty else 0
+            if onnx_ms <= 0 or op not in pt_lookup or pt_lookup[op] == 0:
+                speedups.append(0)
+            else:
+                speedups.append(pt_lookup[op] / onnx_ms)
+
+        offset = (i - (len(backends) - 1) / 2) * bar_width
+        bars = ax1.bar(x + offset, speedups, bar_width, label=backend,
+                       color=BACKEND_COLORS.get(backend, "#999"),
+                       edgecolor="black", linewidth=0.5)
+        for bar, s in zip(bars, speedups):
+            if s > 0:
+                ax1.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 1,
+                         f"{s:.0f}x", ha="center", va="bottom", fontsize=9, fontweight="bold")
+
+    ax1.set_xticks(x)
+    ax1.set_xticklabels([OP_LABELS[op] for op in OPS], fontsize=10)
+    ax1.set_ylabel("Speedup vs PyTorch", fontsize=12)
+    ax1.set_title("ONNX Custom Op Speedup over PyTorch Reference (B=1, D=768, L=1024)", fontsize=13)
+    ax1.legend(fontsize=10)
+    ax1.grid(axis="y", alpha=0.3)
+
+    # --- Bottom: absolute latency bars (log scale) ---
+    all_backends = ["pytorch"] + backends
+    n_bars = len(all_backends)
+    bar_width_abs = 0.8 / n_bars
+
+    for i, backend in enumerate(all_backends):
+        latencies = []
+        for op in OPS:
+            if backend == "pytorch":
+                latencies.append(pt_lookup.get(op, 0))
+            else:
+                row = onnx[(onnx["op"] == op) & (onnx["backend"] == backend)]
+                latencies.append(row["median_ms"].values[0] if not row.empty else 0)
+
+        offset = (i - (n_bars - 1) / 2) * bar_width_abs
+        color = "#78909C" if backend == "pytorch" else BACKEND_COLORS.get(backend, "#999")
+        ax2.bar(x + offset, latencies, bar_width_abs, label=backend, color=color,
+                edgecolor="black", linewidth=0.5)
+
+    ax2.set_yscale("log")
+    ax2.set_xticks(x)
+    ax2.set_xticklabels([OP_LABELS[op] for op in OPS], fontsize=10)
+    ax2.set_ylabel("Median Latency (ms, log)", fontsize=12)
+    ax2.set_title("Absolute Latency Comparison", fontsize=13)
+    ax2.legend(fontsize=10)
+    ax2.grid(axis="y", alpha=0.3)
+
     plt.tight_layout()
-    plt.savefig("benchmarks/results/scaling_D.png", dpi=150)
-    print("Saved benchmarks/results/scaling_D.png")
+    fname = os.path.join(output_dir, "speedup.png")
+    plt.savefig(fname, dpi=150)
+    print(f"Saved {fname}")
     plt.close()
 
 
-def plot_op_comparison_bar(df):
-    """Bar chart comparing all 4 ops at a fixed configuration."""
-    # Use L=1024, D=768 from Scaling_L data
-    df_L = df[df['Scenario'] == 'Scaling_L']
-    if df_L.empty:
-        print("No data for op comparison.")
+def plot_feature_cost(df, output_dir):
+    """Grouped bar chart showing absolute latency of each op variant at selected L values."""
+    sub = df[df["scenario"] == "Scaling_L"]
+    if sub.empty:
+        print("No Scaling_L data for feature cost chart, skipping.")
         return
 
-    row = df_L[df_L['L'] == 1024]
-    if row.empty:
-        row = df_L.iloc[-1:]  # Use largest L available
+    # Pick one backend (prefer zig for lower noise)
+    backends = sorted(sub["backend"].unique())
+    backend = "zig" if "zig" in backends else backends[0]
+    sub = sub[sub["backend"] == backend]
 
-    latencies = []
-    labels = []
-    colors = []
-    for op in OPS:
-        col = f'{op}_ms'
-        if col in row.columns:
-            latencies.append(row[col].values[0])
-            labels.append(OP_LABELS[op])
-            colors.append(OP_COLORS[op])
+    piv = sub.pivot_table(index="L", columns="op", values="median_ms").sort_index()
+    if not all(op in piv.columns for op in OPS):
+        print("Not all ops present for feature cost chart, skipping.")
+        return
 
-    plt.figure(figsize=(10, 6))
-    x = np.arange(len(labels))
-    bars = plt.bar(x, latencies, color=colors, edgecolor='black', linewidth=0.5)
+    # Pick a few representative L values
+    sample_Ls = [L for L in [128, 1024, 4096] if L in piv.index]
+    if not sample_Ls:
+        print("No matching L values for feature cost chart, skipping.")
+        return
+    piv = piv.loc[sample_Ls]
 
-    # Add value labels on bars
-    for bar, lat in zip(bars, latencies):
-        plt.text(bar.get_x() + bar.get_width()/2., bar.get_height() + 0.05,
-                f'{lat:.2f}ms', ha='center', va='bottom', fontsize=10)
+    fig, ax = plt.subplots(figsize=(10, 6))
 
-    plt.xticks(x, labels, fontsize=11)
-    plt.ylabel('Latency (ms)', fontsize=12)
-    plt.title(f'Op Variant Comparison (L={int(row["L"].values[0])}, D=768)', fontsize=14)
-    plt.grid(axis='y', alpha=0.3)
+    n_groups = len(sample_Ls)
+    n_bars = len(OPS)
+    bar_width = 0.8 / n_bars
+    x = np.arange(n_groups)
+
+    for i, op in enumerate(OPS):
+        offset = (i - (n_bars - 1) / 2) * bar_width
+        vals = piv[op].values
+        bars = ax.bar(x + offset, vals, bar_width, label=OP_LABELS[op],
+                      color=OP_COLORS[op], edgecolor="black", linewidth=0.5)
+        for bar, v in zip(bars, vals):
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.05,
+                    f"{v:.1f}", ha="center", va="bottom", fontsize=8)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"L={L}" for L in sample_Ls], fontsize=11)
+    ax.set_ylabel("Median Latency (ms)", fontsize=12)
+    ax.set_title(f"Feature Cost Breakdown by Op Variant ({backend}, D=768)", fontsize=13)
+    ax.legend(fontsize=10)
+    ax.grid(axis="y", alpha=0.3)
+
     plt.tight_layout()
-    plt.savefig("benchmarks/results/op_comparison.png", dpi=150)
-    print("Saved benchmarks/results/op_comparison.png")
+    fname = os.path.join(output_dir, "feature_cost.png")
+    plt.savefig(fname, dpi=150)
+    print(f"Saved {fname}")
     plt.close()
 
 
-def plot_overhead_analysis(df):
-    """Visualize overhead from exact discretization and fusion."""
-    df_L = df[df['Scenario'] == 'Scaling_L']
-    if df_L.empty:
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="Plot Mamba benchmark results")
+    parser.add_argument("--input", default=None,
+                        help="pytest-benchmark JSON file (default: latest in .benchmarks/)")
+    parser.add_argument("--output-dir", default="benchmarks/results",
+                        help="Directory for PNG output")
+    args = parser.parse_args()
+
+    if args.input is None:
+        args.input = _find_latest_json()
+        if args.input is None:
+            print("No benchmark JSON found in .benchmarks/.")
+            print("Run: pytest benchmarks/ --benchmark-only --benchmark-save=baseline")
+            return
+
+    if not os.path.exists(args.input):
+        print(f"No data at {args.input}.")
         return
 
-    # Calculate overheads at each sequence length
-    if not all(f'{op}_ms' in df_L.columns for op in OPS):
-        return
+    os.makedirs(args.output_dir, exist_ok=True)
+    df = _load_benchmark_json(args.input)
+    print(f"Loaded {len(df)} benchmark entries from {args.input}")
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    plot_scaling_L(df, args.output_dir)
+    plot_scaling_D(df, args.output_dir)
+    plot_speedup(df, args.output_dir)
+    plot_feature_cost(df, args.output_dir)
 
-    # Exact vs Linear overhead
-    exact_overhead = (df_L['SelectiveScanExact_ms'] / df_L['SelectiveScan_ms'] - 1) * 100
-    fused_exact_overhead = (df_L['SelectiveScanFusedExact_ms'] / df_L['SelectiveScanFused_ms'] - 1) * 100
-
-    ax1.plot(df_L['L'], exact_overhead, marker='o', color='#2196F3', label='Non-fused', linewidth=2)
-    ax1.plot(df_L['L'], fused_exact_overhead, marker='s', color='#9C27B0', label='Fused', linewidth=2)
-    ax1.set_xlabel('Sequence Length (L)', fontsize=12)
-    ax1.set_ylabel('Overhead (%)', fontsize=12)
-    ax1.set_title('Exact Discretization Overhead', fontsize=13)
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
-
-    # Fusion overhead
-    fusion_linear_overhead = (df_L['SelectiveScanFused_ms'] / df_L['SelectiveScan_ms'] - 1) * 100
-    fusion_exact_overhead = (df_L['SelectiveScanFusedExact_ms'] / df_L['SelectiveScanExact_ms'] - 1) * 100
-
-    ax2.plot(df_L['L'], fusion_linear_overhead, marker='o', color='#FF9800', label='Linear', linewidth=2)
-    ax2.plot(df_L['L'], fusion_exact_overhead, marker='s', color='#9C27B0', label='Exact', linewidth=2)
-    ax2.set_xlabel('Sequence Length (L)', fontsize=12)
-    ax2.set_ylabel('Overhead (%)', fontsize=12)
-    ax2.set_title('Fusion (Softplus+SiLU) Overhead', fontsize=13)
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig("benchmarks/results/overhead_analysis.png", dpi=150)
-    print("Saved benchmarks/results/overhead_analysis.png")
-    plt.close()
-
-
-def plot_results():
-    """Generate all plots from benchmark data."""
-    csv_path = "benchmarks/results/benchmark_data.csv"
-    if not os.path.exists(csv_path):
-        print(f"No data found at {csv_path}. Run 'python benchmarks/suite.py --mode scale' first.")
-        return
-
-    os.makedirs("benchmarks/results", exist_ok=True)
-    df = pd.read_csv(csv_path)
-
-    print(f"Loaded {len(df)} rows from {csv_path}")
-    print(f"Columns: {list(df.columns)}")
-
-    plot_scaling_L(df)
-    plot_scaling_D(df)
-    plot_op_comparison_bar(df)
-    plot_overhead_analysis(df)
-
-    print("\nAll plots saved to benchmarks/results/")
+    print(f"\nAll plots saved to {args.output_dir}/")
 
 
 if __name__ == "__main__":
-    plot_results()
+    main()

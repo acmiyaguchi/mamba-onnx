@@ -22,3 +22,31 @@
   - **Solution**: Reduced `L` to 128 for benchmarking.
 - **Current Status**: The benchmark runs but crashes with **Exit Code 139 (Segfault)** when loading/executing the custom op.
 - **Next Step**: Debug the segfault with a minimal unit test.
+
+### Benchmarking Tool Evaluation: asv vs pytest-benchmark
+
+#### Outcome
+
+The project evaluated `asv` and `pytest-benchmark` as replacements for the custom `benchmarks/suite.py` timing harness. **pytest-benchmark was adopted** and `suite.py` was retired.
+
+#### Why pytest-benchmark won
+
+- **Minimal migration effort**: Existing bench calls wrapped in `benchmark.pedantic()` with minimal boilerplate.
+- **Statistical rigor**: Automatic stddev, outlier detection, and configurable rounds — a major upgrade over single-mean `time.perf_counter()` timing.
+- **Fits existing workflow**: Runs via `uv run pytest benchmarks/`, integrates with the existing pytest runner.
+- **JSON export**: `--benchmark-save` produces machine-readable results for diffing across runs (`--benchmark-compare`).
+
+#### Why asv was rejected
+
+- Requires rewriting benchmarks into asv's class-based format.
+- Rebuilds the project per commit via `pip install`, which is slow and fragile with compiled Zig/C++ backends and a custom build system.
+- Value is maximized in CI, which the project doesn't have yet.
+
+#### Current setup
+
+Benchmarks live in `benchmarks/` and run via:
+```bash
+uv run pytest benchmarks/ --benchmark-only
+```
+
+Results are saved to `.benchmarks/` in JSON format. Use `--benchmark-compare` to diff against previous runs.
