@@ -56,8 +56,8 @@ jobs:
       - name: Install and test
         run: |
           pip install dist/*manylinux*.whl
-          pip install pytest torch onnx onnxruntime
-          pytest tests/ --benchmark-skip
+          pip install pytest pytest-benchmark torch onnx onnxruntime
+          pytest tests/
 
   release:
     needs: [build, test]
