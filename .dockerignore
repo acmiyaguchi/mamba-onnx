@@ -1,0 +1,17 @@
+.git/
+.venv/
+__pycache__/
+.zig-cache/
+zig-out/
+build/
+*.pyc
+src/mamba_onnx/*.so
+src/mamba_onnx/*.dylib
+src/mamba_onnx/*.dll
+.pytest_cache/
+.benchmarks/
+benchmarks/results/
+
+# Only need onnxruntime headers, not the full 648MB checkout
+vendor/onnxruntime/*
+!vendor/onnxruntime/include/
