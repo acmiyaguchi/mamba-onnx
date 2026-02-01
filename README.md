@@ -20,20 +20,33 @@ Optimized implementations of the Mamba Selective Scan operator for ONNX Runtime 
 
 ## Installation
 
+Install directly from the latest [GitHub release](https://github.com/acmiyaguchi/mamba-onnx/releases/latest):
+
 ```bash
-# Clone the repository
-git clone https://github.com/your-repo/mamba-onnx.git
-cd mamba-onnx
+# Linux x86_64
+uv pip install "mamba-onnx @ https://github.com/acmiyaguchi/mamba-onnx/releases/latest/download/mamba_onnx-0.1.0-py3-none-manylinux_2_17_x86_64.whl"
 
-# Build both backends (C++ and Zig)
-zig build -Doptimize=ReleaseFast
-
-# Install the Python package
-pip install -e ".[dev]"
-
-# Copy the built library into the package
-zig build install-py
+# macOS x86_64
+uv pip install "mamba-onnx @ https://github.com/acmiyaguchi/mamba-onnx/releases/latest/download/mamba_onnx-0.1.0-py3-none-macosx_11_0_x86_64.whl"
 ```
+
+Or with pip:
+
+```bash
+pip install "https://github.com/acmiyaguchi/mamba-onnx/releases/latest/download/mamba_onnx-0.1.0-py3-none-manylinux_2_17_x86_64.whl"
+```
+
+The C++ backend requires `libomp` at runtime (`apt install libomp-dev` on Debian/Ubuntu). The Zig backend has no extra runtime dependencies.
+
+### From source
+
+```bash
+git clone https://github.com/acmiyaguchi/mamba-onnx.git
+cd mamba-onnx
+pip install -e ".[dev]"
+```
+
+This requires Zig 0.14+ and (optionally) `libomp-dev` for the C++ backend.
 
 ## Usage
 
