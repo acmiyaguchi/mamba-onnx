@@ -9,3 +9,4 @@ src/mamba_onnx/*.so
 src/mamba_onnx/*.dylib
 src/mamba_onnx/*.dll
 benchmarks/models/
+.benchmarks/

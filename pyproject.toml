@@ -17,6 +17,7 @@ dev = [
     "pandas>=2.0.0",
     "einops>=0.7.0",
     "pytest>=7.0.0",
+    "pytest-benchmark>=4.0.0",
 ]
 
 [build-system]
@@ -31,5 +32,6 @@ where = ["src"]
 mamba_onnx = ["libmamba_ops_*.so", "libmamba_ops_*.dylib", "mamba_ops_*.dll"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "benchmarks"]
 python_files = "test_*.py"
+addopts = "--benchmark-skip"

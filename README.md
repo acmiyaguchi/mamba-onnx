@@ -72,17 +72,23 @@ python tests/test_ops.py
 ## Benchmarking
 
 ```bash
-# Compare all ops x both backends vs PyTorch reference
-python benchmarks/suite.py --mode compare --backend both --reps 100
+# Run compare-mode benchmarks
+uv run pytest benchmarks/ --benchmark-only -k "not scale"
 
-# Scaling analysis (L and D sweeps) with both backends
-python benchmarks/suite.py --mode scale --backend both --reps 100
+# Run all benchmarks (compare + scale sweeps)
+uv run pytest benchmarks/ --benchmark-only --benchmark-save=baseline
 
-# Regenerate plots from CSV data
-python benchmarks/plot.py
+# Compare against a saved baseline
+uv run pytest benchmarks/ --benchmark-only --benchmark-compare=0001_baseline
 
-# Profile MambaBlock component breakdown
-python benchmarks/profiler.py
+# Pin thread count
+uv run pytest benchmarks/ --benchmark-only --threads=4
+
+# Profile MambaBlock components (unchanged)
+uv run python benchmarks/profiler.py
+
+# Generate plots from saved results
+uv run python benchmarks/plot.py
 ```
 
 ## Project Structure
