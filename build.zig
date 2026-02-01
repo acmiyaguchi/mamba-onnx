@@ -45,12 +45,12 @@ pub fn build(b: *std.Build) void {
     const copy_step = b.step("install-py", "Install to build/lib/ for Python");
     const copy_cpp = b.addInstallFileWithDir(
         cpp_lib.getEmittedBin(),
-        .{ .custom = "../build/lib" },
+        .{ .custom = "../build/native" },
         b.fmt("{s}mamba_ops_cpp{s}", .{ prefix, ext }),
     );
     const copy_zig = b.addInstallFileWithDir(
         zig_lib.getEmittedBin(),
-        .{ .custom = "../build/lib" },
+        .{ .custom = "../build/native" },
         b.fmt("{s}mamba_ops_zig{s}", .{ prefix, ext }),
     );
     copy_step.dependOn(&copy_cpp.step);
@@ -72,8 +72,8 @@ fn buildCpp(
 
     mod.addIncludePath(b.path("vendor/onnxruntime/include/onnxruntime/core/session"));
 
-    // OpenMP: auto-detect LLVM/Clang libomp (apt install libomp-dev)
-    const omp = findOpenMP();
+    // OpenMP: auto-detect LLVM/Clang libomp (Linux host paths only)
+    const omp = if (target.result.os.tag == .linux) findOpenMP() else null;
     if (omp) |paths| {
         mod.addSystemIncludePath(.{ .cwd_relative = paths.include });
         mod.addLibraryPath(.{ .cwd_relative = paths.lib });

@@ -21,7 +21,7 @@ dev = [
 ]
 
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=61", "wheel"]
 build-backend = "build_backend"
 backend-path = ["."]
 

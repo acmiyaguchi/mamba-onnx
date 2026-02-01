@@ -91,6 +91,51 @@ uv run python benchmarks/profiler.py
 uv run python benchmarks/plot.py
 ```
 
+## Building Wheels
+
+The Docker build cross-compiles wheels for Linux and macOS (both x86_64, AVX2 required):
+
+```bash
+# Build both wheels into dist/
+docker build --target artifacts -o dist .
+
+# Inspect contents
+unzip -l dist/*.whl
+```
+
+Wheels are tagged `manylinux_2_17_x86_64` (Linux) and `macosx_11_0_x86_64` (macOS).
+
+To change the Zig version:
+
+```bash
+docker build --build-arg ZIG_VERSION=0.15.1 --target artifacts -o dist .
+```
+
+## Releasing
+
+Releases are automated via GitHub Actions (`.github/workflows/release.yml`). The workflow builds wheels, runs tests, and uploads them to GitHub Releases.
+
+**To make a release:**
+
+```bash
+# 1. Update the version in pyproject.toml
+# 2. Commit and tag
+git add pyproject.toml
+git commit -m "release: v0.1.0"
+git tag v0.1.0
+
+# 3. Push the tag — this triggers the release workflow
+git push origin v0.1.0
+```
+
+The workflow will:
+1. Build Linux + macOS wheels via Docker
+2. Install the Linux wheel and run `pytest tests/`
+3. If tests pass and the trigger is a `v*` tag, upload wheels to a GitHub Release
+
+**To test the workflow without releasing**, use the manual trigger:
+Actions → Build and Release → Run workflow. This runs build + test but skips the release step.
+
 ## Project Structure
 
 - `src/native/zig/`: Zig implementation of the selective scan kernel.
